@@ -7,6 +7,7 @@
 // - 目录模型 :free 变体：provider.only 真正透传到 OpenRouter，可精确钉住。
 import http from 'node:http';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { Readable, Transform } from 'node:stream';
 import { fileURLToPath } from 'node:url';
@@ -45,11 +46,13 @@ const DEFAULT_CONFIG = {
     'cline-pass/qwen3.7-max',
   ],
   // modelId -> { upstreams: string[]（有序优先列表，空=自动）, exclude: string[]（排除列表，优先级高于勾选）,
-  //              pinMode: 'strict'|'preferred', sort: 'cost'|'ttft'|'tps'|null }
-  // 请求按 upstreams 顺序逐个钉住尝试：第一个异常（非 200 / 网络失败 / 超时）自动顺切下一个，
+  //              pinMode: 'strict'|'preferred', sort: 'cost'|'ttft'|'tps'|null, retries: 1..5（每个渠道的尝试次数） }
+  // 请求按 upstreams 顺序逐个钉住尝试：同一渠道先重试 retries 次（默认 1 = 不重试），仍失败才顺切下一个，
   // 全部失败才把最后一个错误透传给客户端；exclude 中的上游永不被使用（自动模式下注入排除偏好）。
+  // 确定性错误（不可钉 / key 失效）不浪费重试次数，直接跳到下一个渠道。
   // upstream 为旧版单上游兼容镜像（取列表第一个），maxRetries 已退役（旧值仅作回滚兼容保留在文件里）。
   perModel: {},
+  hiddenModels: [],       // 控制台仅隐藏的前端模型 ID（纯展示偏好：不影响代理路由，/v1/models 仍照常返回）
 };
 
 function loadJson(file, fallback) {
@@ -60,7 +63,8 @@ function loadJson(file, fallback) {
   }
 }
 const config = { ...DEFAULT_CONFIG, ...loadJson(CONFIG_PATH, {}) };
-const META = loadJson(META_PATH, { models: {}, history: [], catalog: null, orModelsFetchedAt: 0, orModelList: null });
+const META = loadJson(META_PATH, { models: {}, history: [], catalog: null, orModelsFetchedAt: 0, orModelList: null, quota: {} });
+if (!META.quota) META.quota = {};
 const saveConfig = () => fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
 const saveMeta = () => fs.writeFileSync(META_PATH, JSON.stringify(META, null, 2));
 // 旧版单 apiKey 迁移为账号池
@@ -160,6 +164,57 @@ async function fetchJSON(url, opts = {}, timeoutMs = 60000) {
   }
 }
 
+// ---------- 账号额度（Cline usage-limits）----------
+// 官方接口：GET {upstreamBase}/users/me/plan/usage-limits
+// 响应：{ data: { limits: [{ type: five_hour|weekly|monthly, percentUsed, resetsAt }] } }
+// 只需使用比例与更新时间。缓存写入 META.quota，以 key 指纹为键，避免明文 key 落盘。
+const quotaFingerprint = (key) => crypto.createHash('sha256').update(String(key)).digest('hex').slice(0, 16);
+const QUOTA_WINDOW_KEY = { five_hour: 'fiveHour', weekly: 'weekly', monthly: 'monthly' };
+const QUOTA_REFRESH_MINUTES = Number(process.env.QUOTA_REFRESH_MINUTES ?? 10);
+
+async function fetchQuotaForKey(key) {
+  const base = String(config.upstreamBase || '').replace(/\/+$/, '');
+  const { status, json } = await fetchJSON(`${base}/users/me/plan/usage-limits`, {
+    headers: { Accept: 'application/json', Authorization: `Bearer ${key}` },
+  }, 30000);
+  const limits = json?.data?.limits;
+  if (status < 200 || status >= 300 || !Array.isArray(limits)) {
+    const msg = json?.error?.message || json?.error || `HTTP ${status}`;
+    throw new Error(String(msg).slice(0, 160));
+  }
+  const windows = {};
+  for (const l of limits) {
+    const k = QUOTA_WINDOW_KEY[l?.type];
+    if (!k) continue;
+    const pct = Number(l.percentUsed);
+    windows[k] = {
+      percent: Number.isFinite(pct) ? pct : null,
+      resetsAt: typeof l.resetsAt === 'string' && l.resetsAt ? l.resetsAt : null,
+    };
+  }
+  return { updatedAt: Date.now(), error: null, windows };
+}
+
+// 并行刷新所有账号额度；单个账号失败只记录错误，不影响其他账号。
+async function refreshQuotas() {
+  const accounts = (config.accounts || []).filter((a) => a && a.key);
+  await Promise.all(accounts.map(async (a) => {
+    const fp = quotaFingerprint(a.key);
+    try {
+      META.quota[fp] = await fetchQuotaForKey(a.key);
+    } catch (e) {
+      const prev = META.quota[fp] || {};
+      META.quota[fp] = { ...prev, error: String(e?.message || e).slice(0, 200), updatedAt: Date.now() };
+    }
+  }));
+  saveMeta();
+  return META.quota;
+}
+
+function quotaFor(acc) {
+  return (acc && acc.key && META.quota[quotaFingerprint(acc.key)]) || null;
+}
+
 // ---------- OpenRouter 目录缓存与 slug 归一化 ----------
 async function orModelList() {
   if (META.orModelList && Date.now() - META.orModelsFetchedAt < 6 * 3600e3) return META.orModelList;
@@ -248,6 +303,76 @@ function parseTier0(plan) {
   return [...new Set([m[1], ...m[2].split(/,\s*|\s+and\s+/).map((s) => s.trim()).filter(Boolean)])];
 }
 
+// ---------- 钉住健康度告警 ----------
+// Cline 网关可能悄悄忽略 planner 管道的 providerOptions.gateway.only（实测 2026-09-20：
+// 非法渠道 __probe__ 都不再被路由层拒绝，任何 only 都返回同一上游）。这里把“钉住是否生效”
+// 持久化到 META.models[id].pinHealth，并由 /api/models 汇总成 alerts 供控制台横幅告警。
+function setPinHealth(modelId, patch) {
+  const meta = (META.models[modelId] ||= {});
+  const prev = meta.pinHealth || {};
+  const next = { ...prev, ...patch };
+  // 无变化就不写盘，避免每次请求都落盘
+  if (prev.ok === next.ok && prev.reason === next.reason && prev.actual === next.actual && prev.requested === next.requested) return;
+  meta.pinHealth = next;
+  saveMeta();
+}
+
+// 运行时判定：严格钉住某渠道却命中另一个上游 ⇒ only 被忽略（仅在 planner 管道、strict 模式）。
+// 注意：匹配时不能据此判定“钉住生效”（网关默认就可能选它），因此只向上报警、不自动清除；
+// 清除告警只交给权威哨兵 verifyPin / probeModel 的探测结果。
+function notePinOutcome(modelId, attempt, routing) {
+  if (!attempt?.upstream || attempt.strict === false || !routing || routing.pipeline !== 'planner') return;
+  const actual = routing.finalProvider;
+  if (!actual || actual === attempt.upstream) return;
+  setPinHealth(modelId, {
+    ok: false, pipeline: 'planner', requested: attempt.upstream, actual,
+    reason: `严格钉住 ${attempt.upstream}，实际上游却是 ${actual}：providerOptions.gateway.only 已被 Cline 网关忽略`,
+    checkedAt: Date.now(),
+  });
+  console.warn(`[钉住失效] ${modelId} 请求钉 ${attempt.upstream}，实际命中 ${actual}（providerOptions.gateway.only 被忽略）`);
+}
+
+// 零 token 哨兵：向网关发送非法渠道 only=["__probe__"]。
+// 若 only 仍被遵守 → 路由层报错并列出可用渠道；若被忽略 → 请求照常执行（200 或耗尽 token 的 empty response）。
+// 按管道选参数：planner 用 providerOptions.gateway，direct 用顶层 provider（两者行为不同，不能混用）。
+async function verifyPin(modelId) {
+  const meta0 = META.models[modelId] || {};
+  const isDirect = meta0.pipeline === 'direct';
+  const pipeline = isDirect ? 'direct' : 'planner';
+  const keyPath = isDirect ? 'provider' : 'providerOptions.gateway';
+  const acc = pickAccount();
+  const base = { model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 16 };
+  const body = isDirect
+    ? { ...base, provider: { only: ['__probe__'] } }
+    : { ...base, providerOptions: { gateway: { only: ['__probe__'] } } };
+  const { status, json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, {
+    method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(body),
+  }, 60000).catch(() => ({ status: 0, json: { error: 'network error' } }));
+  const rawErr = json?.error;
+  const errStr = typeof rawErr === 'string' ? rawErr : rawErr ? JSON.stringify(rawErr) : '';
+  const m = /Available providers are:\s*([^.]+)/.exec(errStr);
+  const available = m ? m[1].split(/,\s*/).map((s) => s.trim()).filter((t) => /^[a-z0-9][a-z0-9-]*$/.test(t)) : null;
+  const honored = status >= 400 && (/no allowed providers|no available providers/i.test(errStr) || !!(available && available.length));
+  let actual = null;
+  if (!honored) {
+    const d = json?.data && json.data.choices ? json.data : json;
+    const rt = d?.choices?.[0]?.message?.provider_metadata?.gateway?.routing || d?.provider_metadata?.gateway?.routing || {};
+    actual = rt.finalProvider || (typeof d?.provider === 'string' ? slugify(d.provider) : null);
+  }
+  const health = honored
+    ? { ok: true, pipeline, requested: '__probe__', actual: null, available: available || [], reason: `${keyPath}.only 正常生效：非法渠道被路由层拒绝（可用渠道 ${available?.length ?? 0} 个）`, checkedAt: Date.now() }
+    : { ok: false, pipeline, requested: '__probe__', actual, reason: `向网关发送非法渠道 ${keyPath}.only=["__probe__"] 未被路由层拒绝（请求照常执行），说明 ${keyPath}.only 已被 Cline 网关忽略，钉住参数不生效`, checkedAt: Date.now() };
+  if (available?.length) {
+    const meta = (META.models[modelId] ||= {});
+    meta.availableProviders = available;
+    meta.upstreams = [...new Set([...(meta.upstreams || []), ...available])];
+  }
+  const prev = META.models[modelId]?.pinHealth || {};
+  META.models[modelId] = { ...(META.models[modelId] || {}), pinHealth: { ...prev, ...health } };
+  saveMeta();
+  return { model: modelId, ...health };
+}
+
 async function probeModel(modelId) {
   const acc = pickAccount();
   const t0 = Date.now();
@@ -281,11 +406,18 @@ async function probeModel(modelId) {
     ? [...new Set([...(harvest || []), ...r.fallbacks])]
     : [...new Set([...r.fallbacks, ...(harvest || []), ...Object.keys(detail)])];
   const tier0 = [...new Set([...(prev.tier0 || []), ...parseTier0(r.plan)])];
+  // 规划器管道的钉住健康度：非法渠道能被路由层拒绝 ⇒ only 仍被识别；否则说明参数已被网关忽略
+  const pinHealth = r.pipeline === 'planner'
+    ? (harvest
+      ? { ok: true, pipeline: 'planner', available: harvest, reason: `探测到可用渠道清单（${harvest.length} 个），only 参数可被网关识别`, checkedAt: Date.now() }
+      : { ok: false, pipeline: 'planner', reason: '探测未返回渠道清单：非法渠道 only=["__probe__"] 未被路由层拒绝，钉住参数可能已被 Cline 网关忽略', checkedAt: Date.now() })
+    : prev.pinHealth;
   META.models[modelId] = {
     ...prev,
     ok: true,
     pipeline: r.pipeline,
     pinnable: !!r.pipeline,
+    pinHealth,
     availableProviders: harvest || prev.availableProviders || [],
     canonicalSlug: r.canonicalSlug,
     openrouterSlug: orSlug,
@@ -315,7 +447,9 @@ function learnUpstreamStatus(modelId, upstream, errMsg) {
   const st = classifyUpstreamError(errMsg);
   if (st === 'unknown') return;
   const meta = (META.models[modelId] ||= {});
-  meta.upstreamStatus = { ...(meta.upstreamStatus || {}), [upstream]: { status: st, note: String(errMsg).slice(0, 160), checkedAt: Date.now() } };
+  const prev = (meta.upstreamStatus || {})[upstream] || {};
+  // 保留「校验」实测出的 ms（这里没有可比的端到端计时，不要把延迟抹掉）
+  meta.upstreamStatus = { ...(meta.upstreamStatus || {}), [upstream]: { status: st, ms: prev.ms, note: String(errMsg).slice(0, 160), checkedAt: Date.now() } };
 }
 
 // 自动+排除模式：only 白名单与网关侧渠道清单不一致时，网关报错会附最新清单，合并学习
@@ -331,7 +465,8 @@ function learnAvailableProviders(modelId, errMsg) {
   if (meta.upstreams.length !== before) saveMeta();
 }
 
-// 批量校验：把模型的每个上游渠道用最小请求各钉一次，标记真实可用性
+// 批量校验：把模型的每个上游渠道用最小请求各钉一次，标记真实可用性与实测延迟
+// 延迟 = 该渠道端到端耗时（含排队/首字/16 token 生成），并发 5 条测同一批，仅供横向对比
 async function validateUpstreams(modelId) {
   const meta = META.models[modelId] || {};
   const list = meta.upstreams || [];
@@ -339,6 +474,16 @@ async function validateUpstreams(modelId) {
   const acc = pickAccount();
   const results = {};
   const batch = 5;
+  // 规划器管道：先用非法渠道哨兵验证 only 是否仍被网关遵守。若已被忽略，逐渠道 only 校验毫无意义
+  // （每次都会成功），必须把结果标为不可信，避免给出“全部可用”的假绿。
+  let pinBroken = false;
+  if (pipeline === 'planner') {
+    const harvest = await harvestAvailableProviders(modelId, 'planner');
+    pinBroken = !harvest;
+    setPinHealth(modelId, harvest
+      ? { ok: true, pipeline: 'planner', available: harvest, reason: `网关按 only 限制路由（可用渠道 ${harvest.length} 个）`, checkedAt: Date.now() }
+      : { ok: false, pipeline: 'planner', reason: '非法渠道 only=["__probe__"] 未被路由层拒绝，providerOptions.gateway.only 已被忽略，钉住与校验结果均不可信', checkedAt: Date.now() });
+  }
   for (let i = 0; i < list.length; i += batch) {
     await Promise.all(list.slice(i, i + batch).map(async (slug) => {
       const t0 = Date.now();
@@ -358,12 +503,16 @@ async function validateUpstreams(modelId) {
       } else if (json?.data?.choices || json?.choices) {
         status = 'ok';
       }
-      results[slug] = { status, ms: Date.now() - t0, note };
+      if (pinBroken) {
+        status = 'unknown';
+        note = '钉住参数已被网关忽略，无法验证该渠道是否真正被使用（结果不可信）';
+      }
+      results[slug] = { status, ms: Date.now() - t0, note, checkedAt: Date.now() };
     }));
   }
-  META.models[modelId] = { ...meta, upstreamStatus: { ...(meta.upstreamStatus || {}), ...results }, validatedAt: Date.now() };
+  META.models[modelId] = { ...(META.models[modelId] || meta), upstreamStatus: { ...(meta.upstreamStatus || {}), ...results }, pinBroken, validatedAt: Date.now() };
   saveMeta();
-  return results;
+  return { results, pinBroken };
 }
 
 // 从官方接口、官方文档与社区注册表拉取最新 ClinePass 订阅模型清单（只增不删）
@@ -506,9 +655,14 @@ function injectPrefs(body, modelId, { upstream, orderRest = [], excludeList = []
   return b;
 }
 
-// 由 perModel 配置展开出故障转移候选序列：[{ upstream, orderRest, excludeList, strict, sort }, ...]
-// - 勾选了上游（排除后非空）：逐个尝试，排除的永不在候选中
-// - 未勾选：单候选自动模式，排除换算成 only 白名单注入（见 injectPrefs）
+// 由 perModel 配置展开出故障转移候选序列：[{ upstream, orderRest, excludeList, strict, sort, try, tries }, ...]
+// - 勾选了上游（排除后非空）：逐个尝试，每个渠道连续尝试 retries 次后才换下一个，排除的永不在候选中
+// - 未勾选：自动模式单候选（同样按 retries 重试），排除换算成 only 白名单注入（见 injectPrefs）
+const RETRY_MAX = 5;
+function normRetries(v) {
+  const n = Math.floor(Number(v));
+  return Number.isFinite(n) && n >= 1 ? Math.min(n, RETRY_MAX) : 1;
+}
 function buildAttempts(modelId, cfg) {
   const listed = (cfg?.upstreams || []).filter((u) => typeof u === 'string' && u);
   const exclude = (cfg?.exclude || []).filter((u) => typeof u === 'string' && u);
@@ -516,16 +670,102 @@ function buildAttempts(modelId, cfg) {
   const wanted = listed.filter((u) => !excl.has(u));
   const strict = (cfg?.pinMode || 'strict') === 'strict';
   const sort = cfg?.sort || null;
-  const base = { strict, sort, excludeList: exclude };
+  const tries = normRetries(cfg?.retries);
+  const base = { strict, sort, excludeList: exclude, tries };
+  // 同一渠道的重试连续展开在一起：a,a,a → b,b,b（用完次数才顺切）
+  const repeat = (a) => Array.from({ length: tries }, (_, k) => ({ ...a, try: k + 1 }));
   if (wanted.length) {
     // preferred 模式：当前上游排在 order 首位，其余勾选项作为网关侧回退序列；排除列表随行（限制网关回退范围）
-    return wanted.map((u, i) => ({ ...base, upstream: u, orderRest: strict ? [] : wanted.filter((_, j) => j !== i) }));
+    return wanted.flatMap((u, i) => repeat({ ...base, upstream: u, orderRest: strict ? [] : wanted.filter((_, j) => j !== i) }));
   }
-  return [{ ...base, upstream: null, orderRest: [], excludeList: exclude }];
+  return repeat({ ...base, upstream: null, orderRest: [], excludeList: exclude });
 }
+
+// 确定性失败（渠道不可钉 / key 失效）重试没有意义，直接放弃该渠道剩余次数；
+// 限流、5xx、网络失败、超时属于瞬时问题，值得重试。
+function retryWorthwhile(msg) {
+  const st = classifyUpstreamError(msg);
+  return st !== 'bad' && st !== 'auth';
+}
+const RETRY_BACKOFF_MS = 400;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // 把上游错误信息归一成短字符串（用于学习与尝试日志）
 const errText = (e) => (e == null ? '' : typeof e === 'string' ? e : JSON.stringify(e));
+
+// 把一段 SSE 文本聚合成与上游非流式一致的 chat.completion 对象。
+// Cline 网关的非流式应答会把 content / tool_calls / usage / provider_metadata 都放进一个对象，
+// 这里按 chunk 语义还原，保证下游客户端拿到的结构与直接非流式一致。
+async function collectStreamAsChat(res) {
+  const text = await res.text();
+  const agg = { id: null, created: null, model: null, content: '', reasoning: '', reasoningDetails: [], toolCalls: [], finishReason: null, role: 'assistant', usage: null, providerMetadata: null };
+  for (const rawLine of text.split('\n')) {
+    const line = rawLine.trim();
+    if (!line.startsWith('data:')) continue;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === '[DONE]') continue;
+    let chunk;
+    try { chunk = JSON.parse(payload); } catch { continue; }
+    if (chunk.id) agg.id = agg.id || chunk.id;
+    if (chunk.created) agg.created = agg.created || chunk.created;
+    if (chunk.model) agg.model = agg.model || chunk.model;
+    if (chunk.usage) agg.usage = chunk.usage;
+    const ch = chunk.choices?.[0];
+    if (!ch) continue;
+    const d = ch.delta || {};
+    if (typeof d.content === 'string') agg.content += d.content;
+    if (typeof d.reasoning === 'string') agg.reasoning += d.reasoning;
+    if (Array.isArray(d.reasoning_details)) agg.reasoningDetails.push(...d.reasoning_details);
+    if (d.provider_metadata) agg.providerMetadata = d.provider_metadata;
+    if (d.role) agg.role = d.role;
+    if (Array.isArray(d.tool_calls)) {
+      for (const tc of d.tool_calls) {
+        const idx = Number.isInteger(tc.index) ? tc.index : 0;
+        const slot = (agg.toolCalls[idx] ||= { id: undefined, type: 'function', function: { name: '', arguments: '' } });
+        if (tc.id) slot.id = tc.id;
+        if (tc.type) slot.type = tc.type;
+        if (tc.function) {
+          if (tc.function.name) slot.function.name = tc.function.name;
+          if (typeof tc.function.arguments === 'string') slot.function.arguments += tc.function.arguments;
+        }
+      }
+    }
+    if (ch.finish_reason) agg.finishReason = ch.finish_reason;
+  }
+  const toolCalls = agg.toolCalls.filter(Boolean);
+  const message = { role: agg.role, content: agg.content || (toolCalls.length ? null : '') };
+  if (agg.reasoning) { message.reasoning = agg.reasoning; message.reasoning_content = agg.reasoning; }
+  if (agg.reasoningDetails.length) message.reasoning_details = agg.reasoningDetails;
+  if (toolCalls.length) message.tool_calls = toolCalls;
+  if (agg.providerMetadata) message.provider_metadata = agg.providerMetadata;
+  const body = {
+    id: agg.id || `chatcmpl-${Date.now()}`,
+    object: 'chat.completion',
+    created: agg.created || Math.floor(Date.now() / 1000),
+    model: agg.model || null,
+    choices: [{ index: 0, message, logprobs: null, finish_reason: agg.finishReason || 'stop' }],
+  };
+  if (agg.usage) body.usage = agg.usage;
+  return body;
+}
+
+// 非流式兼容降级：Cline 网关在「模型只产出推理、content 为空且无 tool_calls」时，
+// 非流式接口会直接 500 {"error":"empty response content"}，但同一请求改走流式却 200（SSE 只含 reasoning 增量）。
+// 这里在原非流式请求报该错时自动改走流式并把 SSE 聚合成非流式结构返回，避免下游拿到 5xx。
+async function attemptStreamCompat(modelId, body, attempt, signal, acc) {
+  const send = injectPrefs({ ...body, stream: true }, modelId, attempt);
+  try {
+    const res = await fetch(`${config.upstreamBase}/chat/completions`, {
+      method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(send), signal,
+    });
+    const ctype = res.headers.get('content-type') || '';
+    if (res.status !== 200 || !ctype.includes('event-stream')) return null;
+    const out = await collectStreamAsChat(res);
+    return { status: 200, out, routing: parseRouting(out), netError: null, acc, compat: 'stream-fallback' };
+  } catch {
+    return null;
+  }
+}
 
 // 单次向上游网关发起非流式请求；返回 { status, out, routing, netError, acc }
 // 异常（网络错误/非 JSON/非 200）不抛出，由调用方决定切换
@@ -539,27 +779,41 @@ async function attemptOnce(modelId, body, attempt, signal) {
     const json = await res.json().catch(() => null);
     if (!json) return { status: 502, out: { error: { message: 'upstream returned non-JSON', type: 'upstream_error' } }, routing: {}, netError: 'non-JSON response', acc };
     const { status, body: out, routing } = unwrap(json);
+    // 非流式空内容错误：改走流式聚合成一条成功的非流式应答（见 attemptStreamCompat 注释）
+    if (status !== 200 && /empty response content/i.test(errText(out?.error?.message))) {
+      const fb = await attemptStreamCompat(modelId, body, attempt, signal, acc);
+      if (fb) return fb;
+    }
     return { status, out, routing, netError: null, acc };
   } catch (e) {
     return { status: 502, out: { error: { message: `upstream fetch failed: ${e.message}`, type: 'upstream_error' } }, routing: {}, netError: e.message, acc };
   }
 }
 
-// 顺序故障转移：依次执行候选，非 200 / 网络失败 / 超时即切换下一个；全部失败返回最后一次结果。
+// 顺序故障转移：依次执行候选（同一渠道先重试 retries 次），非 200 / 网络失败 / 超时即换下一次；全部失败返回最后一次结果。
+// 确定性错误（不可钉 / key 失效）不消耗剩余重试次数，直接跳到下一个渠道。
 // 流式：首包前（网关以 JSON 而非 SSE 应答错误）仍可切换；SSE 一旦开始即透传，无法重试。
 // 每次尝试有独立的超时中止（attemptTimeoutMs）；客户端断开会中止当前尝试。
-// 返回 { status, out, routing, acc, trace, streamUp? } —— trace 为逐次尝试 [{ upstream, status, ms, note }]
-async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTimeoutMs = 120000 } = {}) {
+// 返回 { status, out, routing, acc, trace, streamUp? } —— trace 为逐次尝试 [{ upstream, status, ms, note, try, tries }]
+async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTimeoutMs = 120000, res = null } = {}) {
   const attempts = buildAttempts(modelId, cfg);
   const trace = [];
   const t0 = Date.now();
   let last = null;
   let activeCtrl = null;            // 当前尝试的 AbortController；流式成功后保持指向该次 fetch，用于断连时中止上游 body
   let keepCloseHook = false;        // 流式 SSE 建立后，close 钩子要保留到流结束
+  const giveUp = new Set();         // 确定性失败的渠道：剩余重试直接跳过
   const onClientClose = () => { if (activeCtrl) activeCtrl.abort(); };
   req.on('close', onClientClose);
   try {
     for (const attempt of attempts) {
+      const who = attempt.upstream || 'auto';
+      if (attempt.try > 1) {
+        if (giveUp.has(who)) continue;                                  // 确定性错误，不浪费重试
+        // 客户端已走就别重试了（注意：req.destroyed 在读完 body 后就是 true，不能当作断连判据）
+        if (res && (res.destroyed || res.writableEnded)) break;
+        await sleep(Math.min(RETRY_BACKOFF_MS * (attempt.try - 1), 1500)); // 递增退避，给限流一点恢复时间
+      }
       const t1 = Date.now();
       const ctrl = new AbortController();
       activeCtrl = ctrl;
@@ -617,31 +871,42 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
             }
             try { json = JSON.parse(text); } catch {}
             const msg = errText(json?.error) || text.slice(0, 160) || netError;
-            trace.push({ upstream: attempt.upstream, status: up.status, ms, note: msg.slice(0, 160) });
+            trace.push({ upstream: attempt.upstream, status: up.status, ms, note: msg.slice(0, 160), try: attempt.try, tries: attempt.tries });
             if (attempt.upstream) learnUpstreamStatus(modelId, attempt.upstream, msg);
             if (!attempt.upstream && (attempt.excludeList || []).length) learnAvailableProviders(modelId, msg);
-            last = { status: json?.error ? 502 : up.status, out: json || { error: { message: text.slice(0, 400) || netError, type: 'upstream_error' } }, routing: parseRouting(json || {}), acc, netError: null };
+            if (!retryWorthwhile(msg)) giveUp.add(who);
+            // 网关偶尔对流式请求回非 SSE 的完整 JSON：走与非流式一致的解包（去掉 data 包裹、统一错误形式）
+            const u = json ? unwrap(json) : null;
+            last = u
+              ? { status: u.status, out: u.body, routing: u.routing, acc, netError: null }
+              : { status: 502, out: { error: { message: text.slice(0, 400) || netError, type: 'upstream_error' } }, routing: {}, acc, netError: null };
+            // 无 error 的完整 JSON 就是一次成功应答，不要再重试/换渠道
+            if (last.status === 200) break;
             continue; // 错误：还未向客户端写任何字节，可切换下一候选
           }
           if (!up) {
-            trace.push({ upstream: attempt.upstream, status: 502, ms, note: netError || 'no response' });
+            trace.push({ upstream: attempt.upstream, status: 502, ms, note: netError || 'no response', try: attempt.try, tries: attempt.tries });
             last = { status: 502, out: { error: { message: `upstream fetch failed: ${netError || 'no response'}`, type: 'upstream_error' } }, routing: {}, acc, netError: netError || 'no response' };
             continue;
           }
           // 真 SSE：firstChunk 与剩余 body 串联透传（SSE 开始后无法重试）；close 钩子保留用于客户端断开时中止上游
           keepCloseHook = true;
-          trace.push({ upstream: attempt.upstream, status: 200, ms, note: 'stream' });
+          trace.push({ upstream: attempt.upstream, status: 200, ms, note: 'stream', try: attempt.try, tries: attempt.tries });
           return { status: 200, streamUp: up, streamHead: firstChunk, acc, trace, t0 };
         }
         // 非流式
         const r = await attemptOnce(modelId, body, attempt, ctrl.signal);
         const ms = Date.now() - t1;
-        const note = r.netError || (r.status !== 200 ? errText(r.out?.error?.message).slice(0, 160) : 'ok');
-        trace.push({ upstream: attempt.upstream, status: r.status, ms, note });
+        const note = r.compat ? `${r.compat} (upstream empty content compat)` : (r.netError || (r.status !== 200 ? errText(r.out?.error?.message).slice(0, 160) : 'ok'));
+        trace.push({ upstream: attempt.upstream, status: r.status, ms, note, try: attempt.try, tries: attempt.tries });
         if (r.status !== 200 && attempt.upstream) learnUpstreamStatus(modelId, attempt.upstream, errText(r.out?.error?.message));
         if (r.status !== 200 && !attempt.upstream && (attempt.excludeList || []).length) learnAvailableProviders(modelId, r.netError || note);
+        if (r.status !== 200 && !r.netError && !retryWorthwhile(errText(r.out?.error?.message))) giveUp.add(who);
         last = r;
-        if (r.status === 200) break;
+        if (r.status === 200) {
+          notePinOutcome(modelId, attempt, r.routing);
+          break;
+        }
       } finally {
         clearTimeout(timer);
       }
@@ -660,10 +925,10 @@ async function handleChat(req, res) {
   if (!modelId) return sendJSON(res, 400, { error: { message: 'model is required' } });
 
   const cfg = config.perModel[modelId] || {};
-  const targets = buildAttempts(modelId, cfg).map((a) => a.upstream).filter(Boolean);
+  const targets = [...new Set(buildAttempts(modelId, cfg).map((a) => a.upstream).filter(Boolean))];
   const isStream = !!body.stream;
 
-  const chain = await runChatChain(req, body, modelId, cfg, { stream: isStream });
+  const chain = await runChatChain(req, body, modelId, cfg, { stream: isStream, res });
 
   if (isStream && chain.streamUp) {
     // 流式透传：先写已探测的首块，再接剩余 body；tap 在结束时回读路由元数据并记录
@@ -686,7 +951,7 @@ async function handleChat(req, res) {
       transform(c, enc, cb) { buf.push(c); cb(null, c); },
       flush(cb) {
         const text = Buffer.concat(buf).toString('utf8');
-        let provider = null, canonical = null;
+        let provider = null, canonical = null, streamPipeline = null;
         // direct 管道：最后一个 chunk 顶层带 provider（显示名）与 model
         const lines = text.split('\n');
         for (let i = lines.length - 1; i >= 0 && i >= lines.length - 10 && !provider; i--) {
@@ -694,7 +959,7 @@ async function handleChat(req, res) {
           if (!l.startsWith('data: ') || l.includes('[DONE]')) continue;
           try {
             const c = JSON.parse(l.slice(6));
-            if (typeof c.provider === 'string') { provider = slugify(c.provider); canonical = c.model || null; }
+            if (typeof c.provider === 'string') { provider = slugify(c.provider); canonical = c.model || null; streamPipeline = 'direct'; }
           } catch { /* 跳过不完整行 */ }
         }
         // planner 管道：final chunk 的 provider_metadata.gateway.routing
@@ -703,8 +968,15 @@ async function handleChat(req, res) {
           const cs = /"canonicalSlug":"([^"]+)"/.exec(text);
           provider = fp ? fp[1] : null;
           canonical = cs ? cs[1] : null;
+          if (provider) streamPipeline = 'planner';
         }
-        record(modelId, { provider, canonical, ms: Date.now() - t0, stream: true, error: null, account: acc.name, attempts: chain.trace.map((t) => t.upstream || 'auto') });
+        // 流式也做运行时钉住校验：严格钉的渠道与实际命中不一致 ⇒ only 被忽略
+        if (streamPipeline === 'planner' && provider) {
+          const okAttempt = chain.trace.find((t) => t.status === 200);
+          const cfgNow = config.perModel[modelId] || {};
+          if (okAttempt?.upstream) notePinOutcome(modelId, { upstream: okAttempt.upstream, strict: (cfgNow.pinMode || 'strict') === 'strict' }, { pipeline: 'planner', finalProvider: provider });
+        }
+        record(modelId, { provider, canonical, ms: Date.now() - t0, stream: true, error: null, account: acc.name, attempts: chain.trace.map((t) => t.upstream || 'auto'), trace: chain.trace });
         cb();
       },
     });
@@ -780,7 +1052,15 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && p === '/api/models') {
       const cat = await catalog();
       const sub = config.knownModels.map((id) => ({ id, config: config.perModel[id] || {}, meta: META.models[id] || null }));
-      return sendJSON(res, 200, { subscription: sub, catalogCount: cat.length, catalog: cat, proxyBase: publicProxyBase(), officialFetch: META.officialModelsFetch || null });
+      // 汇总钉住失效告警：planner 管道官方已忽略 providerOptions.gateway.only 的模型
+      const alerts = [];
+      for (const id of config.knownModels) {
+        const ph = META.models[id]?.pinHealth;
+        if (ph && ph.ok === false) {
+          alerts.push({ model: id, pipeline: ph.pipeline || 'planner', reason: ph.reason || '', actual: ph.actual || null, requested: ph.requested || null, checkedAt: ph.checkedAt || null });
+        }
+      }
+      return sendJSON(res, 200, { subscription: sub, hiddenModels: config.hiddenModels || [], catalogCount: cat.length, catalog: cat, proxyBase: publicProxyBase(), officialFetch: META.officialModelsFetch || null, alerts });
     }
     if (req.method === 'POST' && p === '/api/probe') {
       const { model } = await JSON.parse(await readBody(req).then((b) => b.toString()));
@@ -788,17 +1068,25 @@ const server = http.createServer(async (req, res) => {
       const r = await probeModel(model);
       return sendJSON(res, r.ok ? 200 : 502, r);
     }
+    if (req.method === 'POST' && p === '/api/check-pin') {
+      // 零 token 哨兵：判断 providerOptions.gateway.only 是否仍被网关遵守（专治静默失效）
+      const { model } = await JSON.parse(await readBody(req).then((b) => b.toString()));
+      if (!model) return sendJSON(res, 400, { error: { message: 'model required' } });
+      const r = await verifyPin(model);
+      return sendJSON(res, 200, { ok: true, ...r });
+    }
     if (req.method === 'POST' && p === '/api/test') {
-      // 临时配置可带 upstreams/exclude（数组）或旧版 upstream（单值），完整走故障转移链路
-      const { model, upstream, upstreams, exclude } = await JSON.parse(await readBody(req).then((b) => b.toString()));
+      // 临时配置可带 upstreams/exclude（数组）或旧版 upstream（单值）、retries，完整走故障转移链路
+      const { model, upstream, upstreams, exclude, retries } = await JSON.parse(await readBody(req).then((b) => b.toString()));
       if (!model) return sendJSON(res, 400, { error: 'model required' });
       const t0 = Date.now();
       const cfg = { ...(config.perModel[model] || {}) };
       if (upstreams !== undefined) cfg.upstreams = upstreams;
       else if (upstream !== undefined) cfg.upstreams = upstream ? [upstream] : [];
       if (exclude !== undefined) cfg.exclude = exclude;
+      if (retries !== undefined) cfg.retries = retries;
       const body = { model, messages: [{ role: 'user', content: 'Reply with the word OK' }], max_tokens: 256 };
-      const chain = await runChatChain(req, body, model, cfg, { stream: false, attemptTimeoutMs: 180000 });
+      const chain = await runChatChain(req, body, model, cfg, { stream: false, attemptTimeoutMs: 180000, res });
       const trace = chain.trace || [];
       if (chain.status !== 200) {
         return sendJSON(res, 200, {
@@ -807,7 +1095,7 @@ const server = http.createServer(async (req, res) => {
         });
       }
       const r = parseRouting(chain.out);
-      record(model, { provider: r.finalProvider, canonical: r.canonicalSlug, ms: Date.now() - t0, stream: false, attempts: trace.map((t) => t.upstream || 'auto'), error: null, account: chain.acc?.name || null });
+      record(model, { provider: r.finalProvider, canonical: r.canonicalSlug, ms: Date.now() - t0, stream: false, attempts: trace.map((t) => t.upstream || 'auto'), trace, error: null, account: chain.acc?.name || null });
       return sendJSON(res, 200, {
         ok: true, ms: Date.now() - t0,
         targets: (cfg.upstreams || []).filter(Boolean), exclude: cfg.exclude || [],
@@ -818,7 +1106,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && p === '/api/accounts') {
       return sendJSON(res, 200, {
-        accounts: config.accounts,
+        accounts: (config.accounts || []).map((a) => ({ ...a, quota: quotaFor(a) })),
         mode: config.accountMode,
         active: config.activeAccount,
         stats: META.stats || {},
@@ -839,6 +1127,7 @@ const server = http.createServer(async (req, res) => {
       config.activeAccount = Math.min(Math.max(0, Number(body.active) || 0), accs.length - 1);
       saveConfig();
       RR_COUNTER = 0;
+      refreshQuotas().catch(() => {}); // 保存后后台刷新额度，不阻塞响应
       return sendJSON(res, 200, { ok: true, accounts: config.accounts.length, mode: config.accountMode, active: config.activeAccount });
     }
     if (req.method === 'POST' && p === '/api/accounts/test') {
@@ -863,6 +1152,10 @@ const server = http.createServer(async (req, res) => {
       }
       return sendJSON(res, 200, { ok: true, ms: Date.now() - t0, model });
     }
+    if (req.method === 'POST' && p === '/api/quota/refresh') {
+      await refreshQuotas();
+      return sendJSON(res, 200, { ok: true, quota: META.quota });
+    }
     if (req.method === 'GET' && p === '/api/security') {
       return sendJSON(res, 200, { proxyKey: config.proxyKey || '', publicBaseUrl: config.publicBaseUrl || '', authRequired: !!PROXY_KEY, exposeCatalog: !!config.exposeCatalog });
     }
@@ -878,19 +1171,25 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && p === '/api/validate-upstreams') {
       const { model } = JSON.parse(await readBody(req).then((b) => b.toString()));
       if (!model) return sendJSON(res, 400, { error: { message: 'model required' } });
-      const results = await validateUpstreams(model);
+      const { results, pinBroken } = await validateUpstreams(model);
       const summary = { ok: 0, limited: 0, bad: 0, auth: 0, unknown: 0 };
       for (const r of Object.values(results)) summary[r.status] = (summary[r.status] || 0) + 1;
-      return sendJSON(res, 200, { ok: true, summary, results, upstreams: META.models[model]?.upstreams || [] });
+      return sendJSON(res, 200, { ok: true, summary, results, pinBroken, upstreams: META.models[model]?.upstreams || [] });
     }
     if (req.method === 'POST' && p === '/api/fetch-official-models') {
       const r = await fetchOfficialModels();
       return sendJSON(res, 200, { ok: true, ...r });
     }
     if (req.method === 'GET' && p === '/api/history') return sendJSON(res, 200, { history: META.history });
-    if (req.method === 'GET' && p === '/api/config') return sendJSON(res, 200, { port: config.port, perModel: config.perModel, knownModels: config.knownModels });
+    if (req.method === 'GET' && p === '/api/config') return sendJSON(res, 200, { port: config.port, perModel: config.perModel, knownModels: config.knownModels, hiddenModels: config.hiddenModels || [] });
     if (req.method === 'POST' && p === '/api/config') {
       const body = JSON.parse(await readBody(req).then((b) => b.toString()));
+      if (body.hiddenModels) {
+        // 控制台“隐藏模型”只是前端展示偏好：保存到顶层列表，不写入 perModel，也不影响代理。
+        config.hiddenModels = [...new Set((Array.isArray(body.hiddenModels) ? body.hiddenModels : [])
+          .map((s) => String(s).trim()).filter(Boolean))];
+        saveConfig();
+      }
       if (body.perModel) {
         for (const [m, c] of Object.entries(body.perModel)) {
           const normalize = (v) => [...new Set((Array.isArray(v) ? v : []).map((s) => String(s).trim()).filter(Boolean))].slice(0, 10);
@@ -905,6 +1204,7 @@ const server = http.createServer(async (req, res) => {
             exclude,
             pinMode: c.pinMode === 'preferred' ? 'preferred' : 'strict',
             sort: ['cost', 'ttft', 'tps'].includes(c.sort) ? c.sort : null,
+            retries: normRetries(c.retries),
           };
         }
         saveConfig();
@@ -938,3 +1238,29 @@ server.listen(config.port, BIND_HOST, () => {
   console.log(`Cline Pass 上游控制台:  http://127.0.0.1:${config.port}/`);
   console.log(`OpenAI 兼容代理地址:   http://127.0.0.1:${config.port}/v1`);
 });
+
+// ---------- 订阅模型清单自动同步 ----------
+// knownModels 只是 config.example.json 里的静态种子清单，官方上新（如 cline-pass/deepseek-v4.1-flash）
+// 时不会自动出现，只能靠手动点「拉取官方最新模型」，很容易漏。这里启动后拉一次并定时复查，
+// 只增不删、失败静默，不影响服务启动。设 MODELS_REFRESH_HOURS=0 可关闭。
+const MODELS_REFRESH_HOURS = Number(process.env.MODELS_REFRESH_HOURS ?? 6);
+async function autoRefreshModels() {
+  try {
+    const r = await fetchOfficialModels();
+    if (r.added?.length) console.log(`[模型同步] 新增 ${r.added.length} 个订阅模型：${r.added.join('、')}`);
+    else if (!r.sources.length) console.warn('[模型同步] 所有来源均不可达，清单保持不变');
+  } catch (e) {
+    console.warn(`[模型同步] 拉取失败（不影响服务）：${e.message}`);
+  }
+}
+if (Number.isFinite(MODELS_REFRESH_HOURS) && MODELS_REFRESH_HOURS > 0) {
+  setTimeout(autoRefreshModels, 3000).unref();
+  setInterval(autoRefreshModels, MODELS_REFRESH_HOURS * 3600 * 1000).unref();
+}
+
+// ---------- 账号额度定时刷新 ----------
+// 启动后拉一次，之后每 QUOTA_REFRESH_MINUTES 分钟自动刷新；失败静默（错误已记入 META.quota）。
+if (Number.isFinite(QUOTA_REFRESH_MINUTES) && QUOTA_REFRESH_MINUTES > 0) {
+  setTimeout(() => refreshQuotas().catch(() => {}), 1500).unref();
+  setInterval(() => refreshQuotas().catch(() => {}), QUOTA_REFRESH_MINUTES * 60 * 1000).unref();
+}

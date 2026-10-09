@@ -33,6 +33,7 @@
   .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; background: #243447; color: #9cc3ff; }
   .badge.green { background: #1d3a2a; color: var(--green); }
   .badge.orange { background: #3d2f1a; color: var(--orange); }
+  .badge.red { background: #3d221f; color: #ff8f86; }
   select, input[type=number] { background: var(--card2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-size: 12.5px; max-width: 200px; }
   input[type=number] { width: 64px; }
   .row-actions { display: flex; gap: 6px; }
@@ -46,6 +47,22 @@
   @keyframes r { to { transform: rotate(360deg); } }
   .empty { color: var(--dim); font-size: 13px; padding: 14px 10px; }
   .match { color: var(--green); } .mismatch { color: var(--orange); }
+  /* 账号额度：仿 AxonHub 的用量时间条——绿条=已用比例，下方小三角=重置时间在窗口中的进度位置 */
+  /* 账号额度：仿 AxonHub 的用量时间条。每个账号三个窗口横排，悬停用自绘 tooltip（比原生 title 稳定） */
+  .qbwrap { position: relative; display: inline-flex; flex-direction: row; gap: 5px; align-items: center; padding: 4px 0 7px; cursor: default; }
+  .qbar { position: relative; display: block; width: 40px; height: 6px; border-radius: 999px; background: #242a36; pointer-events: none; }
+  .qbar > i { display: block; height: 100%; border-radius: 999px; pointer-events: none; }
+  .qbar > b { position: absolute; top: 7px; left: 0; width: 0; height: 0; border-left: 3px solid transparent; border-right: 3px solid transparent; border-bottom: 4px solid var(--dim); transform: translateX(-50%); pointer-events: none; }
+  .qerr { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--red); }
+  .qbwrap::after {
+    content: attr(data-tip);
+    position: absolute; left: 50%; bottom: calc(100% + 8px); transform: translateX(-50%);
+    white-space: pre; width: max-content; max-width: 340px;
+    background: #0b0e14; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 9px; font-size: 11.5px; line-height: 1.55; text-align: left;
+    box-shadow: 0 6px 18px rgba(0,0,0,.55); opacity: 0; visibility: hidden; z-index: 100; pointer-events: none;
+  }
+  .qbwrap:hover::after { opacity: 1; visibility: visible; }
   tr.row-new td { animation: newflash 4s ease-out; }
   @keyframes newflash { 0% { background: #1f3d2a; } 70% { background: #1f3d2a; } 100% { background: transparent; } }
   /* 上游优先级/排除面板 */
@@ -64,6 +81,10 @@
   .upstat { flex: none; font-size: 11.5px; min-width: 52px; text-align: right; }
   .upstat.ok { color: var(--green); } .upstat.limited { color: var(--orange); } .upstat.bad { color: var(--red); } .upstat.auth { color: var(--red); } .upstat.unknown { color: var(--dim); }
   .upstat.excl { color: var(--red); font-weight: 600; }
+  /* 校验实测延迟：绿=快 橙=中 红=慢 */
+  .upms { flex: none; font-size: 11.5px; min-width: 54px; text-align: right; font-variant-numeric: tabular-nums; }
+  .upms.fast { color: var(--green); } .upms.mid { color: var(--orange); } .upms.slow { color: var(--red); } .upms.none { color: var(--dim); }
+  .uprow.excluded .upms { opacity: .5; }
   /* 药丸切换按钮：整颗可点（约 60×30px），三态：默认灰 / 优先蓝 / 排除红 */
   .pill { flex: none; border: 1px solid var(--border); background: transparent; color: var(--dim); border-radius: 15px; padding: 5px 14px; font-size: 12px; cursor: pointer; min-width: 56px; text-align: center; line-height: 1; }
   .pill:hover { border-color: var(--accent); color: var(--text); }
@@ -82,6 +103,28 @@
   .trace .tr { font-family: Consolas, monospace; }
   .trace .tr.ok { color: var(--green); }
   .trace .tr.bad { color: var(--orange); }
+  .trx { color: var(--accent); font-weight: 700; }
+  /* 路由策略单元格：分段选择器 + 人话说明 + 渠道选择 + 参数预览 */
+  .policy { display: flex; flex-direction: column; gap: 8px; min-width: 420px; }
+  .seg { display: inline-flex; align-self: flex-start; background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 2px; gap: 2px; }
+  .seg button { background: transparent; color: var(--dim); border-radius: 6px; padding: 6px 11px; font-size: 12.5px; line-height: 1.2; white-space: nowrap; }
+  .seg button:hover { color: var(--text); }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .policy-desc { font-size: 12px; line-height: 1.65; color: var(--dim); }
+  .policy-desc b { color: var(--text); font-weight: 600; }
+  .policy-desc .chain { font-family: Consolas, monospace; color: #9cc3ff; }
+  .policy-warn { color: var(--orange); }
+  .snippet { font-family: Consolas, monospace; font-size: 11.5px; color: var(--dim); background: #131620; border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; margin-top: 4px; white-space: pre-wrap; word-break: break-all; }
+  .snip-wrap summary { font-size: 11.5px; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11.5px; color: var(--dim); padding: 2px 6px 8px; border-bottom: 1px dashed #232733; margin-bottom: 2px; }
+  .sortline { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--dim); }
+  select:disabled { opacity: .4; cursor: not-allowed; }
+  .howto { margin-bottom: 12px; }
+  .howto summary { color: var(--accent); font-size: 12.5px; }
+  .howto table { margin-top: 8px; font-size: 12.5px; }
+  .howto td { vertical-align: top; }
+  .howto td:first-child { white-space: nowrap; color: var(--text); font-weight: 600; }
+  .valsum { font-size: 11px; }
 </style>
 </head>
 <body>
@@ -96,14 +139,17 @@
   </div>
 
   <h1>Cline Pass 上游控制台</h1>
-  <div class="sub">本地代理 + 观测面板 —— 枚举订阅模型背后的上游，多上游按优先级自动故障转移，支持精确钉住 / 优先回退 / 排除上游 / 成本·首字·吞吐排序</div>
+  <div class="sub">本地代理 + 观测面板 —— 枚举订阅模型背后的渠道，三种路由策略：自动 / 只用选中的（严格钉住）/ 优先选中的（失败回退），支持排除渠道与成本·首字·吞吐排序</div>
 
   <div id="noKeyBanner" class="banner" style="display:none; border-left-color: var(--red);">
     <b>尚未配置上游 API Key：</b>在下方「账号管理」添加你的 Cline Pass 账号（sk_ 开头的 key）并保存即可开始使用；也可通过 config.json 的 accounts 或环境变量 CLINE_PASS_KEY 提供。
   </div>
 
-  <div class="banner">
-    <b>实测结论（决定了本工具的工作方式）：</b><br>
+  <div id="pinAlert" class="banner" style="display:none; border-left-color: var(--red);"></div>
+
+  <details class="banner">
+    <summary style="color:var(--text)"><b>实测原理：为什么能钉住上游（点开看细节）</b></summary>
+    <div style="margin-top:10px">
     ① <b>上游可枚举、可观测</b>：订阅模型响应元数据里带背后真正的模型 ID、可用上游列表与本次实际命中的上游；
     「探测」按钮还会用一次零 token 消耗的假上游请求让网关报出精确的可用上游清单（直连→OpenRouter，规划器→Vercel AI Gateway）。<br>
     ② <b>两类管道都能精确钉住上游</b>（已实测 <code class="mono">finalProvider</code> 随之改变）：
@@ -111,14 +157,18 @@
     规划器管道（Vercel AI Gateway）必须用 <code class="mono">providerOptions.gateway.only / order</code>——
     Cline 会丢弃顶层 <code class="mono">provider</code> 简写里的 <code class="mono">only/order</code>，但会透传 <code class="mono">providerOptions.gateway</code>。
     两类管道还都支持 <code class="mono">sort</code>（最低成本 / 最快首字 / 最高吞吐）。<br>
+    <b class="policy-warn">⚠ 2026-09 起规划器可能静默失效</b>：Cline 已多次变更规划器，部分模型的
+    <code class="mono">providerOptions.gateway.only</code> 会被整个忽略（连非法渠道 <code class="mono">__probe__</code> 都不再被路由层拒绝）。
+    控制台会自动检测并在顶部弹出<b>钉住失效告警</b>，失效时「校验」不再给假绿，而是标为未判定。直连管道（顶层 <code class="mono">provider.only</code>）目前不受影响。<br>
     ③ <b>目录模型 :free 变体</b>：属于直连管道，可精确钉住。<br>
     ④ <b>多上游优先级 + 故障转移</b>：勾选多个上游即按勾选顺序逐个尝试——第一个异常（报错/网络失败/超时）自动顺切下一个，全部失败才把错误透传给客户端；「排除」的上游永不被使用（自动模式下会向网关注入排除偏好）。流式请求在首包（SSE 开始）前同样可切换，SSE 开始后透传不可重试。
-  </div>
+    </div>
+  </details>
 
   <div class="toolbar">
     <span class="chip" id="proxyBase" title="点击复制：把任意 OpenAI 兼容客户端的 Base URL 指向这里"></span>
     <button class="ghost" onclick="loadAll()">↻ 刷新</button>
-    <button class="ghost" onclick="probeAll()" id="probeAllBtn">批量探测订阅模型</button>
+    <button class="ghost" onclick="probeAll()" id="probeAllBtn" title="只探测主列表中可见的模型，已隐藏的模型会跳过">批量探测可见模型</button>
     <span class="dim" style="font-size:12px" id="status"></span>
   </div>
 
@@ -133,11 +183,12 @@
       <label class="dim" style="font-size:12px"><input type="checkbox" id="accShowKeys" onchange="toggleKeyVis()"> 显示密钥</label>
       <button class="ghost" onclick="addAccountRow()">＋ 添加账号</button>
       <button onclick="saveAccounts()">保存账号配置</button>
+      <button class="ghost" onclick="refreshQuota(this)" title="立即从 Cline 拉取所有账号的额度（默认每 10 分钟自动刷新）">刷新额度</button>
       <span class="dim" style="font-size:12px" id="accMsg"></span>
     </div>
     <table>
-      <thead><tr><th>使用</th><th>名称</th><th>API Key</th><th>启用</th><th>请求数</th><th>最近使用</th><th>操作</th></tr></thead>
-      <tbody id="accBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+      <thead><tr><th>使用</th><th>名称</th><th>API Key</th><th>启用</th><th>额度（5h / 周 / 月）</th><th>请求数</th><th>最近使用</th><th>操作</th></tr></thead>
+      <tbody id="accBody"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody>
     </table>
   </div>
 
@@ -169,12 +220,28 @@
       </div>
     </div>
     <div class="result" id="fetchResult" style="display:none; margin-bottom:12px;"></div>
+    <details class="howto">
+      <summary>怎么配？三种路由策略的区别（点开）</summary>
+      <table>
+        <tr><td>⚡ 自动</td><td class="dim">不指定渠道，网关自己挑。只有「排除」生效（换算成白名单注入）。<b class="dim">适合</b>：对渠道没要求，只要能用。</td></tr>
+        <tr><td>📌 只用选中的</td><td class="dim">只允许选中的渠道（<code class="mono">only=[当前]</code>）。选 1 个 = 死钉它，失败直接报错；选多个 = 按顺序逐个死钉尝试，前一个报错/超时才切下一个，全失败才报错。<b class="dim">适合</b>：必须走指定渠道，比如官方 deepseek。</td></tr>
+        <tr><td>🔀 优先选中的</td><td class="dim">选中的排在前面（<code class="mono">order=[当前, 其余选中]</code>），一次尝试内网关也可以自己换渠道，排除项仍不会被用。<b class="dim">适合</b>：有偏好但更看可用性。</td></tr>
+        <tr><td>排序偏好</td><td class="dim">让网关按最低成本 / 最快首字 / 最高吞吐给渠道排序。只在「自动」「优先选中的」下有意义 —— 严格只允许一个渠道，没有可排序空间。</td></tr>
+      </table>
+    </details>
     <table>
       <thead><tr>
-        <th>模型</th><th>背后模型</th><th>上游数</th><th>最近实际上游</th><th>上游优先级 / 排除（多选）</th><th>模式 / 排序</th><th>操作</th>
+        <th style="width:24%">模型</th><th style="width:19%">背后模型 / 最近命中</th><th>路由策略</th><th style="width:86px">操作</th>
       </tr></thead>
-      <tbody id="subBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+      <tbody id="subBody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
     </table>
+    <details id="hiddenWrap" style="margin-top:14px; display:none;">
+      <summary class="dim" id="hiddenSummary" style="font-size:13px">已隐藏的模型</summary>
+      <table style="margin-top:8px;">
+        <thead><tr><th style="width:40%">模型</th><th>背后模型 / 最近命中</th><th style="width:130px">操作</th></tr></thead>
+        <tbody id="hiddenBody"></tbody>
+      </table>
+    </details>
   </div>
 
   <div class="card">
@@ -189,7 +256,10 @@
   </div>
 
   <div class="card">
-    <h2>请求历史（最近 100 条，经代理的请求自动记录）</h2>
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+      <h2 style="margin:0">请求历史（最近 100 条，经代理的请求自动记录）</h2>
+      <label class="dim" style="font-size:13px" title="开启后每 5 秒静默拉取一次，只有内容变化才重绘；页面切到后台时自动暂停"><input type="checkbox" id="histAuto" onchange="toggleHistAuto(this.checked)"> 每 5 秒自动刷新</label>
+    </div>
     <table>
       <thead><tr><th>时间</th><th>模型</th><th>账号</th><th>实际上游</th><th>背后模型</th><th>耗时</th><th>方式</th><th>尝试序列</th></tr></thead>
       <tbody id="histBody"><tr><td colspan="7" class="empty">暂无记录</td></tr></tbody>
@@ -213,6 +283,14 @@ let DATA = null;
 let AUTH_KEY = localStorage.getItem('cps_key') || '';
 const $ = (s) => document.querySelector(s);
 const fmt = (ts) => new Date(ts).toLocaleTimeString();
+const fmtShortTime = (ts) => {
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return '—';
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+};
+// 仅用于显示：去掉 cline-pass/ 前缀；请求 value / data-id / onclick 仍用完整 id
+const shortId = (id) => String(id || '').replace(/^cline-pass\//, '');
 
 async function api(path, body) {
   const headers = body ? { 'Content-Type': 'application/json' } : {};
@@ -240,10 +318,35 @@ const ST_TAG = { ok: '✔可用', limited: '⏳限流', bad: '✘不可钉', aut
 const ST_RANK = { ok: 0, limited: 1, unknown: 2, auth: 3, bad: 4 };
 const ST_CLS = { ok: 'ok', limited: 'limited', bad: 'bad', auth: 'auth' };
 
-// 排序后的上游 slug 列表（按校验状态：可用优先），供面板与测试台共用
+// 「校验」实测延迟（一条 16 token 最小请求的端到端耗时）
+function msOf(meta, slug) {
+  const v = ((meta && meta.upstreamStatus) || {})[slug];
+  return typeof v?.ms === 'number' ? v.ms : null;
+}
+function msLabel(ms) { return ms == null ? '—' : ms >= 10000 ? (ms / 1000).toFixed(1) + ' s' : ms + ' ms'; }
+function msCls(ms) { return ms == null ? 'none' : ms < 1500 ? 'fast' : ms < 4000 ? 'mid' : 'slow'; }
+
+// 排序后的上游 slug 列表：先按校验状态（可用优先），同状态内按实测延迟由快到慢
+// （未校验的排在同状态末尾）。面板、测试台下拉、「全选」共用同一顺序。
 function sortedUpstreams(meta) {
   const stMap = (meta && meta.upstreamStatus) || {};
-  return [...((meta && meta.upstreams) || [])].sort((a, b) => (ST_RANK[stMap[a]?.status] ?? 2) - (ST_RANK[stMap[b]?.status] ?? 2));
+  return [...((meta && meta.upstreams) || [])].sort((a, b) => {
+    const r = (ST_RANK[stMap[a]?.status] ?? 2) - (ST_RANK[stMap[b]?.status] ?? 2);
+    if (r) return r;
+    return (msOf(meta, a) ?? Infinity) - (msOf(meta, b) ?? Infinity);
+  });
+}
+
+// 最快的可用渠道（校验状态 ok 且有延迟数据）
+function fastestUpstream(meta) {
+  const stMap = (meta && meta.upstreamStatus) || {};
+  let best = null;
+  for (const u of (meta && meta.upstreams) || []) {
+    const ms = msOf(meta, u);
+    if (stMap[u]?.status !== 'ok' || ms == null) continue;
+    if (!best || ms < best.ms) best = { slug: u, ms };
+  }
+  return best;
 }
 
 // 测试台仍用单选下拉（选中即作为唯一优先上游测试）
@@ -254,14 +357,15 @@ function upstreamOptions(meta, selected) {
     const detail = (meta && meta.upstreamDetail) || {};
     const d = detail[u];
     const st = stMap[u]?.status;
-    const tag = st && ST_TAG[st] ? ' · ' + ST_TAG[st] : '';
+    const ms = msOf(meta, u);
+    const tag = (st && ST_TAG[st] ? ' · ' + ST_TAG[st] : '') + (ms != null ? ' · ' + msLabel(ms) : '');
     const label = d ? `${u}（${d.name}${d.endpoints > 1 ? ' ×' + d.endpoints : ''}${tag}）` : `${u}${tag}`;
     html += `<option value="${u}" ${u === selected ? 'selected' : ''}>${label}</option>`;
   }
   return html;
 }
 
-// 主表每行的上游优先级/排除面板：<details> 内逐行「优先 / 排除」药丸切换
+// 主表每行的渠道选择面板：<details> 内逐行「选用 / 排除」药丸切换
 // 状态存在 data-* 属性上，切换时原地更新（updateRowUi），不重建 DOM
 function upstreamPanel(id, meta, cfg) {
   const ups = sortedUpstreams(meta);
@@ -277,81 +381,253 @@ function upstreamPanel(id, meta, cfg) {
     const isEx = excSet.has(u);
     const stTxt = st && ST_TAG[st] ? ST_TAG[st] : '';
     const stCls = ST_CLS[st] || 'unknown';
+    const ms = msOf(meta, u);
+    const checked = stMap[u]?.checkedAt ? `｜校验于 ${new Date(stMap[u].checkedAt).toLocaleString()}` : '';
     return `<div class="uprow${isEx ? ' excluded' : ''}" data-m="${id}" data-u="${u}" data-stat="${stTxt}" data-statcls="${stCls}">
-      <span class="upno" title="优先级顺序（尝试顺序）">${no >= 0 ? no + 1 : ''}</span>
+      <span class="upno" title="尝试顺序：数字小的先用">${no >= 0 ? no + 1 : ''}</span>
       <span class="upinfo"><span class="upslug mono">${u}</span><span class="upname" title="${d ? d.name : ''}">${d ? d.name : ''}${d && d.endpoints > 1 ? ' ×' + d.endpoints : ''}</span></span>
+      <span class="upms ${msCls(ms)}" title="「校验」实测延迟：一条 16 token 最小请求的端到端耗时（含排队/首字/生成，仅供横向对比）${checked}">${msLabel(ms)}</span>
       <span class="upstat ${isEx ? 'excl' : stCls}">${isEx ? '🚫已排除' : stTxt}</span>
-      <button class="pill${isSel ? ' prio-on' : ''}" title="优先：加入尝试序列（异常自动顺切下一个）；再点一次取消" onclick="toggleUp('${id}','sel','${u}',${isSel ? 'false' : 'true'})">优先</button>
-      <button class="pill${isEx ? ' excl-on' : ''}" title="排除：该上游永不被使用；再点一次取消" onclick="toggleUp('${id}','excl','${u}',${isEx ? 'false' : 'true'})">排除</button>
-      <button class="ghost mini arrow-btn" style="${isSel ? '' : 'display:none'}" onclick="moveUp('${id}','${u}')" title="上移提高优先级">↑</button>
-      <button class="ghost mini arrow-btn" style="${isSel ? '' : 'display:none'}" onclick="moveDown('${id}','${u}')" title="下移降低优先级">↓</button>
+      <button class="pill${isSel ? ' prio-on' : ''}" title="选用：加入尝试序列（序号小的先用，异常自动顺切下一个）；再点一次取消" onclick="toggleUp('${id}','sel','${u}',${isSel ? 'false' : 'true'})">${isSel ? '已选' : '选用'}</button>
+      <button class="pill${isEx ? ' excl-on' : ''}" title="排除：该渠道永不被使用（含自动/回退时）；再点一次取消" onclick="toggleUp('${id}','excl','${u}',${isEx ? 'false' : 'true'})">排除</button>
+      <button class="ghost mini arrow-btn" style="${isSel ? '' : 'display:none'}" onclick="moveUp('${id}','${u}')" title="上移：更早被尝试">↑</button>
+      <button class="ghost mini arrow-btn" style="${isSel ? '' : 'display:none'}" onclick="moveDown('${id}','${u}')" title="下移：更晚被尝试">↓</button>
     </div>`;
   }).join('');
   return `<details class="ups-wrap">
-    <summary><span class="ups-sum">${summaryChips(cfg)}</span></summary>
-    <div class="ups-panel">${rows || '<div class="empty">尚未探测到上游，先点「探测」</div>'}
+    <summary><span class="ups-sum">${summaryChips(cfg, meta)}</span></summary>
+    <div class="ups-panel">
+      <div class="legend"><span>选用 = 加入尝试序列（左侧序号即顺序）</span><span>排除 = 永不使用</span><span>↑↓ = 调顺序</span><span>✔/⏳/✘ = 「校验」实测结果</span><span>ms = 校验实测延迟（同状态内已按快慢排序）</span></div>
+      ${rows || '<div class="empty">尚未探测到渠道，先点右侧「探测」</div>'}
       <div class="ups-tools">
-        <button class="ghost mini" onclick="bulkUp('${id}','all')" title="全部按可用状态排序加入优先序列">全选优先</button>
-        <button class="ghost mini" onclick="bulkUp('${id}','clear')" title="清空优先与排除（回到自动）">清空</button>
-        <span class="dim" style="font-size:11px; align-self:center;">点「优先」按序尝试（异常自动顺切）；点「排除」永不使用</span>
+        <button class="ghost mini" onclick="bulkUp('${id}','all')" title="按可用状态把全部渠道加入尝试序列">全选</button>
+        <button class="ghost mini" onclick="bulkUp('${id}','clear')" title="清空选用与排除，回到自动">清空</button>
       </div>
     </div>
   </details>`;
 }
 
-// 收起状态下的汇总徽章：①fireworks ②sail-research ✕2
-function summaryChips(cfg) {
+// 收起状态下的汇总行：渠道 14｜已选 2｜排除 1 + 前几个已选徽章
+function summaryChips(cfg, meta) {
   const ups = cfg.upstreams || [];
   const exc = cfg.exclude || [];
-  if (!ups.length && !exc.length) return '<span class="sum-auto">自动 · 网关智能选择</span>';
-  let html = '';
+  const total = ((meta && meta.upstreams) || []).length;
+  let html = `<span class="sum-auto">渠道 ${total}｜已选 ${ups.length}｜排除 ${exc.length}</span>`;
   for (let i = 0; i < Math.min(ups.length, 4); i++) html += `<span class="sum-chip">${i + 1}&nbsp;${ups[i]}</span>`;
   if (ups.length > 4) html += `<span class="sum-chip sum-more">+${ups.length - 4}</span>`;
   if (exc.length) html += `<span class="sum-chip sum-ex">✕ ${exc.length}</span>`;
   return html;
 }
 
+// ---------- 路由策略：把 upstreams + pinMode 两个字段合成一个能看懂的概念 ----------
+// auto      不指定渠道（upstreams 为空），网关自选；只有排除生效
+// strict    只用选中的：每次尝试 only=[当前]，按顺序逐个切
+// preferred 优先选中的：每次尝试 order=[当前, 其余选中]，网关侧也能回退
+const POLICY = {
+  auto: { label: '⚡ 自动', hint: '不指定渠道，交给网关智能选择（排除项仍生效）' },
+  strict: { label: '📌 只用选中的', hint: '严格钉住：只允许选中的渠道，按顺序逐个尝试，全部失败才报错' },
+  preferred: { label: '🔀 优先选中的', hint: '优先用选中的渠道，失败时允许网关回退到其他未排除渠道' },
+};
+const SORT_LABEL = { cost: '最低成本', ttft: '最快首字', tps: '最高吞吐' };
+// 每个渠道的尝试次数（1 = 不重试）
+const RETRY_OPTS = [1, 2, 3, 4, 5];
+function retriesOf(cfg) {
+  const n = Math.floor(Number(cfg && cfg.retries));
+  return Number.isFinite(n) && n >= 1 ? Math.min(n, 5) : 1;
+}
+
+function policyOf(cfg) {
+  const ups = (cfg.upstreams || []).filter(Boolean);
+  if (!ups.length) return 'auto';
+  return cfg.pinMode === 'preferred' ? 'preferred' : 'strict';
+}
+
+// 把当前配置翻译成一句人话，直接写在策略选择器下面
+function policyDesc(s) {
+  const cfg = s.config, meta = s.meta || {};
+  const ups = (cfg.upstreams || []).filter(Boolean);
+  const exc = (cfg.exclude || []).filter(Boolean);
+  const known = meta.upstreams || [];
+  const pol = policyOf(cfg);
+  const tries = retriesOf(cfg);
+  const chain = (list) => `<span class="chain">${list.join(' → ')}</span>`;
+  const out = [];
+  if (pol === 'auto') {
+    out.push(known.length
+      ? (exc.length
+        ? `网关在 <b>${Math.max(known.length - exc.length, 0)}</b> 个渠道里自选（已剔除排除的 ${exc.length} 个）`
+        : '网关在全部渠道里自选，本工具不做干预')
+      : '尚未探测渠道，当前完全由网关决定');
+    if (tries > 1) out.push(`失败后重试 <b>${tries - 1}</b> 次（共 ${tries} 次）`);
+  } else if (pol === 'strict') {
+    if (ups.length === 1) {
+      out.push(tries > 1
+        ? `只用 ${chain(ups)} 一个渠道，失败后原地重试 <b>${tries - 1}</b> 次（共 ${tries} 次）；重试用完仍失败才<b class="policy-warn">报错</b>，不会换渠道`
+        : `只用 ${chain(ups)} 一个渠道；它限流或报错时<b class="policy-warn">请求直接失败</b>，不会换渠道`);
+    } else {
+      out.push(tries > 1
+        ? `按顺序逐个尝试 ${chain(ups)}：每次只钉一个，同一渠道连试 <b>${tries}</b> 次才切下一个，<b>${ups.length}</b> 个全失败才报错（最多 ${tries * ups.length} 次尝试）`
+        : `按顺序逐个尝试 ${chain(ups)}：每次只钉一个，前一个报错/超时才切下一个，<b>${ups.length}</b> 个全失败才报错`);
+    }
+  } else {
+    const rest = known.filter((u) => !ups.includes(u) && !exc.includes(u));
+    out.push(`先用 ${chain(ups)}；失败时网关可在其余 <b>${rest.length}</b> 个渠道里回退${exc.length ? `（排除的 ${exc.length} 个除外）` : ''}`);
+    if (tries > 1) out.push(`每个渠道连试 <b>${tries}</b> 次才切下一个`);
+  }
+  if (cfg.sort) out.push(pol === 'strict'
+    ? `<span class="policy-warn">已选的「${SORT_LABEL[cfg.sort]}」在严格模式下不起作用</span>`
+    : `并按<b>${SORT_LABEL[cfg.sort]}</b>排序`);
+  if (tries > 1) out.push('不可钉/key 失效这类确定性错误不消耗重试次数');
+  return out.join('；');
+}
+
+// 展示第一次尝试真实注入的路由参数（与后端 injectPrefs 一致）
+function policySnippet(s) {
+  const cfg = s.config, meta = s.meta || {};
+  const ups = (cfg.upstreams || []).filter(Boolean);
+  const exc = (cfg.exclude || []).filter(Boolean);
+  const known = meta.upstreams || [];
+  const pol = policyOf(cfg);
+  const allow = exc.length ? known.filter((u) => !exc.includes(u)) : null;
+  const o = {};
+  if (pol === 'strict') o.only = [ups[0]];
+  else if (pol === 'preferred') {
+    o.order = ups.slice();
+    if (allow && allow.length) o.only = allow;
+  } else if (allow && allow.length) o.only = allow;
+  if (cfg.sort) o.sort = cfg.sort;
+  if (!Object.keys(o).length) return '不注入任何路由参数，请求原样转发';
+  const key = meta.pipeline === 'direct' ? 'provider' : meta.pipeline === 'planner' ? 'providerOptions.gateway' : 'provider 与 providerOptions.gateway（未探测，两边都写）';
+  return `${key} = ${JSON.stringify(o)}`;
+}
+
+// 路由策略单元格：分段选择器 + 人话说明 + 渠道面板 + 排序 + 参数预览
+function policyCell(s) {
+  const id = s.id, cfg = s.config;
+  const pol = policyOf(cfg);
+  const sort = cfg.sort || '';
+  const tries = retriesOf(cfg);
+  const segs = ['auto', 'strict', 'preferred'].map((p) =>
+    `<button data-p="${p}" class="${p === pol ? 'on' : ''}" title="${POLICY[p].hint}" onclick="setPolicy('${id}','${p}')">${POLICY[p].label}</button>`).join('');
+  return `<div class="policy">
+    <div class="seg">${segs}</div>
+    <div class="policy-desc">${policyDesc(s)}</div>
+    ${upstreamPanel(id, s.meta, cfg)}
+    <div class="sortline">排序偏好
+      <select class="sortsel" onchange="saveCfg('${id}','sort',this.value)" ${pol === 'strict' ? 'disabled title="严格模式只允许一个渠道，排序不起作用"' : 'title="让网关按指标给渠道排序"'}>
+        <option value="" ${!sort ? 'selected' : ''}>不指定</option>
+        <option value="cost" ${sort === 'cost' ? 'selected' : ''}>最低成本</option>
+        <option value="ttft" ${sort === 'ttft' ? 'selected' : ''}>最快首字</option>
+        <option value="tps" ${sort === 'tps' ? 'selected' : ''}>最高吞吐</option>
+      </select>
+      <span title="同一渠道失败后先原地重试到这个次数，再换下一个渠道；重试间隔递增退避 0.4~1.5s">每渠道尝试</span>
+      <select class="retrysel" onchange="saveCfg('${id}','retries',this.value)" title="不可钉/key 失效这类确定性错误不会消耗重试次数，直接换下一个渠道">
+        ${RETRY_OPTS.map((n) => `<option value="${n}" ${tries === n ? 'selected' : ''}>${n === 1 ? '1 次（不重试）' : n + ' 次'}</option>`).join('')}
+      </select>
+    </div>
+    <details class="snip-wrap"><summary class="dim">看实际注入的请求参数</summary><div class="snippet">${escapeHtml(policySnippet(s))}</div></details>
+  </div>`;
+}
+
+// 切换策略：自动 = 清空选用（保留排除）；严格/优先 = 若未选任何渠道，自动选中最优一个作为起点
+function setPolicy(id, p) {
+  const s = DATA.subscription.find((x) => x.id === id);
+  if (!s) return;
+  const cfg = s.config;
+  if (p === 'auto') {
+    if (!(cfg.upstreams || []).length) return;
+    cfg.upstreams = [];
+    updateRowUi(id);
+    saveModelCfg(id, { upstreams: [] });
+    return;
+  }
+  let ups = [...(cfg.upstreams || [])];
+  if (!ups.length) {
+    const best = sortedUpstreams(s.meta).filter((u) => !(cfg.exclude || []).includes(u))[0];
+    if (!best) { status(`${id} 还没有可选渠道，先点「探测」`); return; }
+    ups = [best];
+    status(`已自动选中 ${best}，可在渠道列表里调整`);
+  }
+  cfg.upstreams = ups; cfg.pinMode = p;
+  updateRowUi(id);
+  saveModelCfg(id, { upstreams: ups, pinMode: p });
+}
+
+// 校验结果汇总：✔可用 / ⏳限流 / ✘不可钉
+function validSummary(meta) {
+  const st = meta && meta.upstreamStatus;
+  if (!st || !Object.keys(st).length) return '<span class="dim valsum">渠道未校验</span>';
+  const c = { ok: 0, limited: 0, bad: 0, auth: 0, unknown: 0 };
+  Object.values(st).forEach((v) => { c[v.status] = (c[v.status] || 0) + 1; });
+  const f = fastestUpstream(meta);
+  const fast = f ? ` · <span class="match" title="校验实测最快的可用渠道">⚡${f.slug} ${msLabel(f.ms)}</span>` : '';
+  return `<span class="valsum dim"><span class="match">✔${c.ok}</span> · ⏳${c.limited} · ✘${c.bad + c.auth}${fast}</span>`;
+}
+
+function hiddenSet() { return new Set(DATA.hiddenModels || []); }
+
 function render() {
   $('#proxyBase').textContent = '代理地址：' + DATA.proxyBase + '（点击复制）';
-  const rows = DATA.subscription.map((s) => {
+  // 钉住失效全局告警（planner 管道官方已忽略 providerOptions.gateway.only）
+  const alerts = DATA.alerts || [];
+  const pinEl = $('#pinAlert');
+  if (alerts.length) {
+    pinEl.style.display = 'block';
+    pinEl.innerHTML = '<b>⚠ 钉住参数失效告警：</b>以下模型的 <code class="mono">providerOptions.gateway.only</code> 已被 Cline 网关忽略，选择渠道不再生效（连非法渠道 <code class="mono">__probe__</code> 都不会被拒绝）。<br>' +
+      alerts.map((a) => `· <b class="mono">${shortId(a.model)}</b>：${escapeHtml(a.reason || '')}${a.actual ? `（实际命中 <b>${escapeHtml(a.actual)}</b>）` : ''}`).join('<br>') +
+      '<div class="dim" style="margin-top:6px">建议：这些模型的「只用选中的 / 优先选中的」暂不可用，「校验」结果会显示为未判定以免误判。可点各行「检测钉住」复测；或改用直连（OpenRouter）管道模型。</div>';
+  } else {
+    pinEl.style.display = 'none';
+  }
+  const hs = hiddenSet();
+  const visible = DATA.subscription.filter((s) => !hs.has(s.id));
+  const hidden = DATA.subscription.filter((s) => hs.has(s.id));
+  const rows = visible.map((s) => {
     const m = s.meta;
     const ups = (m?.upstreams?.length ?? null);
     const last = m?.lastProvider ? `<span class="badge">${m.lastProvider}</span>` : '<span class="dim">未探测</span>';
     const canon = m?.canonicalSlug ? `<span class="mono dim">${m.canonicalSlug}</span>` : '<span class="dim">—</span>';
     const tier0 = m?.tier0?.length ? `<div class="dim" style="font-size:11px">tier-0: ${m.tier0.join(', ')}</div>` : '';
-    const pipe = m?.pinnable ? `<span class="badge green">可精确钉住·${m.pipeline === 'planner' ? 'Vercel' : 'OpenRouter'}</span>` : '<span class="badge orange">请先探测</span>';
-    const mode = s.config.pinMode || 'strict';
-    const sort = s.config.sort || '';
+    const pipe = m?.pinnable ? `<span class="badge green" title="路由管道：${m.pipeline === 'planner' ? 'Vercel AI Gateway（规划器）——钉住参数注入 providerOptions.gateway' : 'OpenRouter（直连）——钉住参数注入 provider'}">${m.pipeline === 'planner' ? 'Vercel' : 'OpenRouter'}</span>` : '<span class="badge orange">请先探测</span>';
+    const pinWarn = m?.pinHealth?.ok === false ? `<div style="margin-top:4px"><span class="badge red" title="${escapeHtml(m.pinHealth.reason || '')}">⚠ 钉住失效</span></div>` : '';
     return `<tr${LAST_ADDED.includes(s.id) ? ' class="row-new"' : ''} data-id="${s.id}">
-      <td class="mono">${s.id}<div style="margin-top:4px">${pipe}</div>${tier0}</td>
-      <td>${canon}</td>
-      <td>${ups === null ? '<span class="dim">—</span>' : ups}</td>
-      <td>${last}${m?.lastMs ? `<div class="dim" style="font-size:11px">${m.lastMs} ms</div>` : ''}</td>
-      <td>
-        ${upstreamPanel(s.id, m, s.config)}
+      <td class="mono">${shortId(s.id)}<div style="margin-top:4px">${pipe}</div>${pinWarn}${tier0}</td>
+      <td>${canon}
+        <div class="dim" style="font-size:11.5px; margin-top:4px">渠道 ${ups === null ? '—' : ups} 个 · ${validSummary(m)}</div>
+        <div style="font-size:11.5px; margin-top:4px">最近命中 ${last}${m?.lastMs ? ` <span class="dim">${m.lastMs} ms</span>` : ''}</div>
       </td>
-      <td>
-        <div><select onchange="saveCfg('${s.id}','pinMode',this.value)" title="严格：逐个只钉勾选的上游；优先：当前上游排 order 首位，其余勾选项作为网关侧回退">
-          <option value="strict" ${mode === 'strict' ? 'selected' : ''}>严格钉住</option>
-          <option value="preferred" ${mode === 'preferred' ? 'selected' : ''}>优先+回退</option>
-        </select></div>
-        <select onchange="saveCfg('${s.id}','sort',this.value)" style="margin-top:4px" title="按指标排序上游（不选上游时也可单独使用）">
-          <option value="" ${!sort ? 'selected' : ''}>网关智能选</option>
-          <option value="cost" ${sort === 'cost' ? 'selected' : ''}>最低成本</option>
-          <option value="ttft" ${sort === 'ttft' ? 'selected' : ''}>最快首字</option>
-          <option value="tps" ${sort === 'tps' ? 'selected' : ''}>最高吞吐</option>
-        </select>
-      </td>
-      <td><div class="row-actions">
-        <button class="ghost" onclick="probe('${s.id}', this)">探测</button>
-        <button class="ghost" onclick="test('${s.id}', this)">测试</button>
-        <button class="ghost" onclick="validate('${s.id}', this)" title="把每个上游渠道各钉一次最小请求，标出可用/限流/不可钉">校验</button>
+      <td>${policyCell(s)}</td>
+      <td><div class="row-actions" style="flex-direction:column; gap:4px">
+        <button class="ghost" onclick="probe('${s.id}', this)" title="拉取该模型背后的渠道清单与管道类型（零 token）">探测</button>
+        <button class="ghost" onclick="test('${s.id}', this)" title="按当前策略发一条小请求，看网关是否采纳">测试</button>
+        <button class="ghost" onclick="validate('${s.id}', this)" title="把每个渠道各钉一次最小请求，标出可用/限流/不可钉">校验</button>
+        <button class="ghost" onclick="checkPin('${s.id}', this)" title="零 token：发非法渠道哨兵，判断 providerOptions.gateway.only 是否仍被网关遵守">检测钉住</button>
+        <button class="ghost" onclick="toggleHidden('${s.id}', true)" title="从主列表移到「已隐藏的模型」；仅影响控制台显示，不影响代理调用">隐藏</button>
       </div></td>
     </tr>`;
   }).join('');
-  $('#subBody').innerHTML = rows;
+  $('#subBody').innerHTML = rows || '<tr><td colspan="4" class="empty">没有可见模型，全部已隐藏 —— 可在下方「已隐藏的模型」里点「显示」恢复。</td></tr>';
 
-  $('#testModel').innerHTML = DATA.subscription.map((s) => `<option value="${s.id}">${s.id}</option>`).join('');
+  // 已隐藏模型区：默认收起，展开后可恢复或单独探测
+  $('#hiddenWrap').style.display = hidden.length ? 'block' : 'none';
+  $('#hiddenSummary').textContent = `已隐藏的模型（${hidden.length}）`;
+  $('#hiddenBody').innerHTML = hidden.map((s) => {
+    const m = s.meta;
+    const last = m?.lastProvider ? `<span class="badge">${m.lastProvider}</span>` : '<span class="dim">未探测</span>';
+    const canon = m?.canonicalSlug ? `<span class="mono dim">${m.canonicalSlug}</span>` : '<span class="dim">—</span>';
+    return `<tr data-id="${s.id}">
+      <td class="mono">${shortId(s.id)}</td>
+      <td>${canon}<div style="font-size:11.5px; margin-top:4px">最近命中 ${last}</div></td>
+      <td><div class="row-actions">
+        <button class="ghost" onclick="toggleHidden('${s.id}', false)" title="恢复到上方主列表">显示</button>
+        <button class="ghost" onclick="probe('${s.id}', this)" title="拉取该模型背后的渠道清单（零 token）">探测</button>
+      </div></td>
+    </tr>`;
+  }).join('');
+
+  // 测试台下拉只列可见模型；若全部隐藏则退回全部，避免下拉为空
+  const testList = visible.length ? visible : DATA.subscription;
+  $('#testModel').innerHTML = testList.map((s) => `<option value="${s.id}">${shortId(s.id)}</option>`).join('');
   onTestModelChange();
 
   $('#catSummary').textContent = `展开（共 ${DATA.catalogCount} 个目录模型）`;
@@ -368,7 +644,7 @@ function renderCatalog() {
   $('#catBody').innerHTML = list.map((id) => {
     const m = DATA.subscription.find((s) => s.id === id)?.meta;
     const pinnable = id.includes(':free');
-    return `<tr><td class="mono">${id}</td><td>${pinnable ? '<span class="badge green">:free 可精确钉住</span>' : '<span class="badge orange">规划器管理</span>'}</td>
+    return `<tr><td class="mono">${shortId(id)}</td><td>${pinnable ? '<span class="badge green">:free 可精确钉住</span>' : '<span class="badge orange">规划器管理</span>'}</td>
     <td>${m?.lastProvider ? '<span class="badge">' + m.lastProvider + '</span>' : ''}</td>
     <td><button class="ghost" onclick="probe('${id}', this)">探测</button></td></tr>`;
   }).join('') || '<tr><td class="empty">无匹配</td></tr>';
@@ -432,13 +708,30 @@ async function probe(id, btn) {
   await loadAll();
 }
 
+// 隐藏/恢复模型：纯前端展示偏好，存到服务器配置（跨刷新/跨浏览器生效），不影响代理
+async function toggleHidden(id, hide) {
+  const cur = hiddenSet();
+  if (hide) cur.add(id); else cur.delete(id);
+  DATA.hiddenModels = [...cur];
+  render();
+  try {
+    const r = await api('/api/config', { hiddenModels: DATA.hiddenModels });
+    if (r.ok) status(hide ? `${id} 已隐藏（不影响代理调用）` : `${id} 已恢复显示`);
+    else { status('保存失败，正在回滚…'); await loadAll(); }
+  } catch {
+    status('保存失败，正在回滚…');
+    await loadAll();
+  }
+}
+
 async function probeAll() {
   const btn = $('#probeAllBtn'); btn.disabled = true;
-  for (const s of DATA.subscription) {
-    btn.textContent = `探测中 ${s.id}`;
+  const hs = hiddenSet();
+  for (const s of DATA.subscription.filter((x) => !hs.has(x.id))) {
+    btn.textContent = `探测中 ${shortId(s.id)}`;
     await api('/api/probe', { model: s.id });
   }
-  btn.disabled = false; btn.textContent = '批量探测订阅模型';
+  btn.disabled = false; btn.textContent = '批量探测可见模型';
   await loadAll();
 }
 
@@ -484,11 +777,32 @@ async function validate(id, btn) {
   status(`正在校验 ${id} 的全部上游渠道（约需 1 分钟）…`);
   try {
     const r = await api('/api/validate-upstreams', { model: id });
-    status(`校验完成：✔可用 ${r.summary.ok} · ⏳限流 ${r.summary.limited} · ✘不可钉 ${r.summary.bad} · 🔑key错 ${r.summary.auth} · 未判定 ${r.summary.unknown}（下拉框已标注并排序）`);
+    if (r.pinBroken) {
+      status(`⚠ ${id} 校验不可信：providerOptions.gateway.only 已被网关忽略，各渠道结果均无法验证（已标为未判定）`);
+      await loadAll();
+      btn.disabled = false; btn.textContent = '校验';
+      return;
+    }
+    const fast = Object.entries(r.results || {}).filter(([, v]) => v.status === 'ok' && typeof v.ms === 'number')
+      .sort((a, b) => a[1].ms - b[1].ms).slice(0, 3).map(([u, v]) => `${u} ${msLabel(v.ms)}`).join('、');
+    status(`校验完成：✔可用 ${r.summary.ok} · ⏳限流 ${r.summary.limited} · ✘不可钉 ${r.summary.bad} · 🔑key错 ${r.summary.auth} · 未判定 ${r.summary.unknown}（渠道列表已标注延迟，同状态内按快慢排序）${fast ? ' ｜最快：' + fast : ''}`);
   } catch (e) {
     status('校验失败');
   }
   btn.disabled = false; btn.textContent = '校验';
+  await loadAll();
+}
+
+async function checkPin(id, btn) {
+  btn.disabled = true; btn.textContent = '检测中…';
+  status(`正在检测 ${id} 的钉住参数是否被网关遵守…`);
+  try {
+    const r = await api('/api/check-pin', { model: id });
+    status(r.ok === false
+      ? `⚠ ${id} 钉住失效：${r.reason}`
+      : `✔ ${id} 钉住正常：${r.reason}`);
+  } catch { status('检测失败'); }
+  btn.disabled = false; btn.textContent = '检测钉住';
   await loadAll();
 }
 
@@ -505,11 +819,37 @@ function onTestModelChange() {
   $('#testUpstream').innerHTML = upstreamOptions(m?.meta, null);
 }
 
-// 逐次尝试明细：fireworks(✗429 781ms) → sail-research(✔ 2458ms)
+// 逐次尝试明细：同一渠道的连续重试合并成「渠道 ×n」
+// fireworks×3(✗429 2.1s) → sail-research(✔ 2458ms)
+function groupTrace(trace) {
+  const out = [];
+  for (const t of trace || []) {
+    const up = t.upstream || 'auto';
+    const prev = out[out.length - 1];
+    if (prev && prev.upstream === up && prev.status !== 200) {
+      prev.n += 1; prev.ms += t.ms || 0; prev.status = t.status; prev.note = t.note;
+    } else {
+      out.push({ upstream: up, n: 1, ms: t.ms || 0, status: t.status, note: t.note });
+    }
+  }
+  return out;
+}
+const traceMs = (ms) => (ms >= 10000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms');
 function traceHtml(trace) {
   if (!trace?.length) return '';
-  const parts = trace.map((t) => `<span class="tr ${t.status === 200 ? 'ok' : 'bad'}">${t.upstream || 'auto'}(${t.status === 200 ? '✔' : '✗' + t.status} ${t.ms}ms${t.note && t.status !== 200 && t.note !== 'ok' ? ' · ' + escapeHtml(String(t.note).slice(0, 60)) : ''})</span>`);
+  const parts = groupTrace(trace).map((g) => {
+    const times = g.n > 1 ? `<span class="trx" title="该渠道共尝试 ${g.n} 次（含重试）">×${g.n}</span>` : '';
+    const note = g.note && g.status !== 200 && g.note !== 'ok' ? ' · ' + escapeHtml(String(g.note).slice(0, 60)) : '';
+    return `<span class="tr ${g.status === 200 ? 'ok' : 'bad'}">${g.upstream}${times}(${g.status === 200 ? '✔' : '✗' + g.status} ${traceMs(g.ms)}${note})</span>`;
+  });
   return `<div class="trace">尝试序列：${parts.join(' → ')}</div>`;
+}
+// 历史表格里的紧凑形式（耐旧记录：attempts 只有渠道名字符串）
+function historyTrace(h) {
+  if (h.trace?.length) {
+    return groupTrace(h.trace).map((g) => `${g.upstream}${g.n > 1 ? '×' + g.n : ''}(${g.status === 200 ? '✔' : '✗'}${traceMs(g.ms)})`).join(' → ');
+  }
+  return (h.attempts || []).map((t) => (typeof t === 'string' ? t : `${t.upstream || 'auto'}(${t.status === 200 ? '✔' : '✗'}${traceMs(t.ms || 0)})`)).join(' → ');
 }
 
 function showTest(r, model, target) {
@@ -522,12 +862,12 @@ function showTest(r, model, target) {
   const hit = !targets.length || r.actual === targets[0];
   const hitExcluded = Array.isArray(r.exclude) && r.exclude.length && r.exclude.includes(r.actual);
   el.innerHTML = `<div class="kvs">
-      <div>模型 <b class="mono">${model}</b></div>
+      <div>模型 <b class="mono">${shortId(model)}</b></div>
       <div>目标上游 <b>${targets.length ? targets.join(' → ') : '自动'}</b></div>
       <div>实际上游 <b class="${hit && !hitExcluded ? 'match' : 'mismatch'}">${r.actual || '未知'}</b></div>
       <div>耗时 <b>${r.ms} ms</b></div>
     </div>${traceHtml(r.trace)}
-    ${hitExcluded ? `<div class="mismatch">⚠ 排除未生效：命中了被排除的上游 ${r.actual}（该渠道可能不在本地已知清单内，或网关未遵守白名单；先点「探测」刷新渠道列表再试）</div>` : hit ? '✔ 上游匹配，选择已生效。' : (r.actual ? '✘ 未命中首个目标上游：渠道可能限流或不可钉（点「校验」检查全部渠道）；严格模式失败会直接报错，可改用「优先+回退」。' : '该模型响应未携带上游信息，无法回读实际上游。')}
+    ${hitExcluded ? `<div class="mismatch">⚠ 排除未生效：命中了被排除的上游 ${r.actual}（该渠道可能不在本地已知清单内，或网关未遵守白名单；先点「探测」刷新渠道列表再试）</div>` : hit ? '✔ 上游匹配，选择已生效。' : (r.actual ? (r.pipeline === 'planner' ? '⚠ 未命中目标上游：规划器（Vercel）已忽略 providerOptions.gateway.only，选择渠道不再生效（已触发全局告警，可点「检测钉住」复测）。' : '✘ 未命中首个目标上游：渠道可能限流或不可钉（点「校验」检查全部渠道）；「只用选中的」全部失败会直接报错，可改用「优先选中的」。') : '该模型响应未携带上游信息，无法回读实际上游。')}
     <div class="dim" style="margin-top:6px">回复：${escapeHtml(r.content || '(空)')}　·　背后模型：${r.canonicalSlug || '—'}　·　管道：${r.pipeline === 'direct' ? '直连(OpenRouter)' : r.pipeline === 'planner' ? '规划器(Vercel)' : '未知'}</div>`;
 }
 
@@ -541,11 +881,12 @@ async function saveModelCfg(id, patch) {
     exclude: patch.exclude !== undefined ? patch.exclude : (cfg.exclude || []),
     pinMode: patch.pinMode !== undefined ? patch.pinMode : (cfg.pinMode || 'strict'),
     sort: patch.sort !== undefined ? patch.sort : (cfg.sort || null),
+    retries: patch.retries !== undefined ? patch.retries : retriesOf(cfg),
   };
   try {
     const r = await api('/api/config', { perModel: { [id]: full } });
     if (r.ok) {
-      cfg.upstreams = full.upstreams; cfg.exclude = full.exclude; cfg.pinMode = full.pinMode; cfg.sort = full.sort;
+      cfg.upstreams = full.upstreams; cfg.exclude = full.exclude; cfg.pinMode = full.pinMode; cfg.sort = full.sort; cfg.retries = full.retries;
       status(`${id} 配置已保存`);
     } else {
       status(`${id} 保存失败：${r.error?.message || '未知错误'}`);
@@ -556,12 +897,14 @@ async function saveModelCfg(id, patch) {
   }
 }
 
-// 下拉框保存入口（模式/排序）
+// 下拉框保存入口（模式/排序/重试次数）
 async function saveCfg(id, field, value) {
   const patch = {};
   if (field === 'pinMode') patch.pinMode = value || 'strict';
   else if (field === 'sort') patch.sort = value || null;
+  else if (field === 'retries') patch.retries = retriesOf({ retries: value });
   await saveModelCfg(id, patch);
+  if (field === 'retries') updateRowUi(id);   // 重试次数会改变策略说明那句话
 }
 
 // 面板行内更新：只改 class / 文本 / onclick，绝不重建 DOM —— 面板保持展开、滚动位置不变
@@ -580,6 +923,7 @@ function updateRowUi(id) {
     const pills = row.querySelectorAll('.pill');
     if (pills[0]) {
       pills[0].classList.toggle('prio-on', no >= 0);
+      pills[0].textContent = no >= 0 ? '已选' : '选用';
       pills[0].setAttribute('onclick', `toggleUp('${id}','sel','${u}',${no >= 0 ? 'false' : 'true'})`);
     }
     if (pills[1]) {
@@ -594,10 +938,30 @@ function updateRowUi(id) {
     else { stat.textContent = row.dataset.stat || ''; stat.className = 'upstat ' + (row.dataset.statcls || 'unknown'); }
   });
   const sum = tr.querySelector('.ups-sum');
-  if (sum) sum.innerHTML = summaryChips(cfg);
-  const selects = tr.cells[5].querySelectorAll('select');
-  if (selects[0]) selects[0].value = cfg.pinMode || 'strict';
-  if (selects[1]) selects[1].value = cfg.sort || '';
+  if (sum) sum.innerHTML = summaryChips(cfg, s.meta);
+  refreshPolicyUi(id);
+}
+
+// 策略区原地刷新：分段选中态 / 人话说明 / 排序可用性 / 参数预览
+function refreshPolicyUi(id) {
+  const s = DATA.subscription.find((x) => x.id === id);
+  if (!s) return;
+  const tr = document.querySelector(`#subBody tr[data-id="${id}"]`);
+  if (!tr) return;
+  const pol = policyOf(s.config);
+  tr.querySelectorAll('.seg button').forEach((b) => b.classList.toggle('on', b.dataset.p === pol));
+  const desc = tr.querySelector('.policy-desc');
+  if (desc) desc.innerHTML = policyDesc(s);
+  const snip = tr.querySelector('.snippet');
+  if (snip) snip.textContent = policySnippet(s);
+  const sortSel = tr.querySelector('.sortline select.sortsel');
+  if (sortSel) {
+    sortSel.value = s.config.sort || '';
+    sortSel.disabled = pol === 'strict';
+    sortSel.title = pol === 'strict' ? '严格模式只允许一个渠道，排序不起作用' : '让网关按指标给渠道排序';
+  }
+  const retrySel = tr.querySelector('.sortline select.retrysel');
+  if (retrySel) retrySel.value = String(retriesOf(s.config));
 }
 
 // 面板药丸切换：kind='sel' 优先 | 'excl' 排除（互斥）。乐观更新 + 保存（失败自动回滚）
@@ -653,19 +1017,100 @@ function bulkUp(id, action) {
 
 async function loadHistory() {
   const { history } = await api('/api/history');
+  // 内容未变化时跳过重绘，避免每 5 秒自动刷新时表格闪烁 / 丢失滚动位置
+  const sig = JSON.stringify(history);
+  if (sig === HIST_SIG) return;
+  HIST_SIG = sig;
   $('#histBody').innerHTML = history.length ? history.map((h) => `<tr>
-      <td>${fmt(h.ts)}</td><td class="mono">${h.model}</td>
+      <td>${fmt(h.ts)}</td><td class="mono">${shortId(h.model)}</td>
       <td>${h.account ? '<span class="badge">' + h.account + '</span>' : '<span class="dim">—</span>'}</td>
       <td>${h.provider ? '<span class="badge">' + h.provider + '</span>' : '<span class="dim">—</span>'}</td>
       <td class="mono dim">${h.canonical || '—'}</td>
       <td>${h.ms ?? '—'} ms</td>
       <td>${h.stream ? '流式' : '非流式'}</td>
-      <td class="dim">${(h.trace || h.attempts || []).map((t) => typeof t === 'string' ? t : `${t.upstream || 'auto'}(${t.status === 200 ? '✔' : '✗'}${t.ms}ms)`).join(' → ') || '—'}</td>
+      <td class="dim">${historyTrace(h) || '—'}</td>
     </tr>`).join('') : '<tr><td colspan="8" class="empty">暂无记录 —— 把客户端 Base URL 指向代理地址即可自动记录</td></tr>';
+}
+
+// 请求历史自动刷新（默认开启，可关闭，偏好存 localStorage）
+let HIST_SIG = '';
+let HIST_TIMER = null;
+function startHistAuto() {
+  stopHistAuto();
+  HIST_TIMER = setInterval(() => {
+    if (document.hidden) return;                                   // 页面在后台时暂停
+    if ($('#loginOverlay').style.display === 'flex') return;       // 未登录时不刷
+    loadHistory().catch(() => {});
+  }, 5000);
+}
+function stopHistAuto() { if (HIST_TIMER) { clearInterval(HIST_TIMER); HIST_TIMER = null; } }
+function toggleHistAuto(on) {
+  localStorage.setItem('cps_hist_auto', on ? '1' : '0');
+  if (on) { startHistAuto(); status('请求历史已开启每 5 秒自动刷新'); }
+  else { stopHistAuto(); status('请求历史已关闭自动刷新'); }
 }
 
 let ACCS = null;
 const escapeHtml = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+const QUOTA_WINDOWS = [
+  { key: 'fiveHour', secs: 5 * 3600, label: '5h', cap: 10 },
+  { key: 'weekly', secs: 7 * 24 * 3600, label: '周', cap: 25 },
+  { key: 'monthly', secs: 30 * 24 * 3600, label: '月', cap: 50 },
+];
+
+// 重置时间在窗口内已流逝的比例（AxonHub 的 durationPercent）
+function quotaDurationPct(secs, resetsAt) {
+  if (!resetsAt) return null;
+  const resetMs = new Date(resetsAt).getTime();
+  if (!Number.isFinite(resetMs)) return null;
+  const elapsed = secs - (resetMs - Date.now()) / 1000;
+  return Math.max(0, Math.min(100, (elapsed / secs) * 100));
+}
+
+// 仿 AxonHub：已用比例落后于时间进度时为绿，超出越多越黄越红
+function quotaColor(usagePct, durationPct) {
+  const u = Math.min(Math.max((usagePct || 0) / 100, 0), 1);
+  let severity = u;
+  if (durationPct != null && durationPct > 0) severity = u * (u / Math.max(durationPct / 100, 0.01));
+  severity = Math.min(1, Math.max(0, severity));
+  let h, s, l;
+  if (severity < 0.5) { const n = severity * 2; h = 142 - n * 97; s = 71 + n * 22; l = 45 + n * 2; }
+  else { const n = (severity - 0.5) * 2; h = 45 - n * 45; s = 93 - n * 9; l = 47 + n * 13; }
+  return `hsl(${Math.round(h)}, ${Math.round(s)}%, ${Math.round(l)}%)`;
+}
+
+function fmtTimeLeft(resetsAt) {
+  const ms = new Date(resetsAt).getTime() - Date.now();
+  if (!Number.isFinite(ms)) return '';
+  if (ms <= 0) return '即将重置';
+  const mins = Math.floor(ms / 60000), hours = Math.floor(mins / 60), days = Math.floor(hours / 24);
+  if (days > 0) return `${days}天${hours % 24}小时后重置`;
+  if (hours > 0) return `${hours}小时${mins % 60}分后重置`;
+  return `${mins}分钟后重置`;
+}
+
+// 不显示文字：三个窗口横排的用量时间条（5h/周/月）；悬停弹出金额 tooltip
+function fmtQuota(q) {
+  const w = (q && q.windows) || {};
+  const lines = [];
+  const bars = QUOTA_WINDOWS.map(({ key, secs, label, cap }) => {
+    const x = w[key];
+    const pct = x && Number.isFinite(x.percent) ? x.percent : null;
+    const dur = x ? quotaDurationPct(secs, x.resetsAt) : null;
+    const usedUSD = pct == null ? null : (pct / 100) * cap;
+    const remainUSD = usedUSD == null ? null : Math.max(0, cap - usedUSD);
+    lines.push(pct == null
+      ? `${label}：未获取（上限 $${cap}）`
+      : `${label}：$${usedUSD.toFixed(2)} / $${cap}（${pct}%）剩 $${remainUSD.toFixed(2)}${x && x.resetsAt ? ' · ' + fmtTimeLeft(x.resetsAt) + '（' + fmtShortTime(x.resetsAt) + '）' : ''}`);
+    const fill = pct == null ? 'width:0' : `width:${Math.min(Math.max(pct, 0), 100)}%; background:${quotaColor(pct, dur)}`;
+    const mark = dur == null ? '' : `<b style="left:${dur.toFixed(1)}%"></b>`;
+    return `<span class="qbar"><i style="${fill}"></i>${mark}</span>`;
+  }).join('');
+  const tip = lines.join('\n') + (q && q.error ? `\n⚠ 刷新失败：${q.error}` : '');
+  const err = q && q.error ? `<span class="qerr" title="额度刷新失败：${escapeHtml(q.error)}"></span>` : '';
+  return `<span class="qbwrap" data-tip="${escapeHtml(tip)}">${bars}${err}</span>`;
+}
 
 function renderAccounts() {
   if (!ACCS) return;
@@ -676,9 +1121,10 @@ function renderAccounts() {
     const checked = ACCS.mode === 'single' && i === ACCS.active;
     return `<tr>
       <td><input type="radio" name="accActive" data-i="${i}" ${checked ? 'checked' : ''} ${ACCS.mode !== 'single' ? 'disabled title="轮询模式下按顺序轮流使用"' : 'title="单账号模式下使用此账号"'}></td>
-      <td><input class="accName" data-i="${i}" value="${escapeHtml(a.name)}" style="width:110px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 8px; font-size:12.5px"></td>
-      <td><input class="accKey" data-i="${i}" type="${show ? 'text' : 'password'}" value="${escapeHtml(a.key)}" style="width:100%; min-width:280px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 8px; font-family:Consolas, monospace; font-size:12px"></td>
+      <td><input class="accName" data-i="${i}" value="${escapeHtml(a.name)}" style="width:84px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 8px; font-size:12.5px"></td>
+      <td><input class="accKey" data-i="${i}" type="${show ? 'text' : 'password'}" value="${escapeHtml(a.key)}" style="width:210px; min-width:0; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 8px; font-family:Consolas, monospace; font-size:12px"></td>
       <td><input type="checkbox" class="accEnabled" data-i="${i}" ${a.enabled !== false ? 'checked' : ''}></td>
+      <td>${fmtQuota(a.quota)}</td>
       <td>${st.requests ?? 0}${st.lastError ? '<div class="mismatch" style="font-size:11px">最近有错误</div>' : ''}</td>
       <td class="dim" style="font-size:12px">${st.lastUsed ? fmt(st.lastUsed) : '—'}</td>
       <td><div class="row-actions">
@@ -687,7 +1133,7 @@ function renderAccounts() {
       </div></td>
     </tr>`;
   }).join('');
-  $('#accBody').innerHTML = rows || '<tr><td colspan="7" class="empty">暂无账号，点击「＋ 添加账号」</td></tr>';
+  $('#accBody').innerHTML = rows || '<tr><td colspan="8" class="empty">暂无账号，点击「＋ 添加账号」</td></tr>';
 }
 
 // 把 DOM 里当前编辑值收回 ACCS（避免重渲染丢输入）
@@ -707,8 +1153,33 @@ async function saveAccounts() {
   const payload = collectAccounts();
   if (!payload.accounts.filter((a) => a.key).length) { accMsg('至少需要一个 key 非空的账号', true); return; }
   const r = await api('/api/accounts', payload);
-  if (r.ok) { accMsg(`已保存：${r.accounts} 个账号 · ${r.mode === 'roundrobin' ? '轮询' : '单账号'}模式`); await loadAll(); }
-  else accMsg(r.error?.message || '保存失败', true);
+  if (r.ok) {
+    accMsg(`已保存：${r.accounts} 个账号 · ${r.mode === 'roundrobin' ? '轮询' : '单账号'}模式`);
+    await loadAll();
+    // 后端保存后会在后台刷新额度，稍等再拉一次以显示新账号额度
+    setTimeout(() => loadAccounts().catch(() => {}), 2500);
+  } else accMsg(r.error?.message || '保存失败', true);
+}
+
+// 只重新拉取账号（含额度），不重渲染其他区域；用户正在编辑账号输入框时跳过，避免覆盖未保存的修改
+async function loadAccounts(force = false) {
+  if (!force && $('#accBody') && $('#accBody').contains(document.activeElement)) return;
+  const accs = await api('/api/accounts');
+  ACCS = accs;
+  renderAccounts();
+}
+
+async function refreshQuota(btn) {
+  btn.disabled = true; const old = btn.textContent; btn.textContent = '刷新中…';
+  try {
+    await api('/api/quota/refresh', {});
+    await loadAccounts(true);
+    accMsg('额度已刷新');
+  } catch (e) {
+    accMsg('额度刷新失败：' + (e?.message || e), true);
+  } finally {
+    btn.disabled = false; btn.textContent = old;
+  }
 }
 
 function addAccountRow() {
@@ -757,6 +1228,12 @@ $('#proxyBase').onclick = () => navigator.clipboard.writeText(DATA.proxyBase).th
 $('#testModel').addEventListener('change', onTestModelChange);
 $('#catFilter').addEventListener('input', renderCatalog);
 $('#loginKey').addEventListener('keydown', (e) => { if (e.key === 'Enter') tryLogin(); });
+// 请求历史自动刷新默认开启（localStorage 里存 '0' 表示用户手动关过）
+const HIST_AUTO_ON = localStorage.getItem('cps_hist_auto') !== '0';
+$('#histAuto').checked = HIST_AUTO_ON;
+if (HIST_AUTO_ON) startHistAuto();
+// 账号额度：后端每 10 分钟自动刷新，前端同步刷新展示（每 10 分钟），与后端周期错开避免同时请求
+setInterval(() => loadAccounts().catch(() => {}), 10 * 60 * 1000);
 // 仅当服务端开启鉴权且本地没有已保存的密钥时才弹登录框
 (async () => {
   try {
