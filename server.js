@@ -25,9 +25,7 @@ const DEFAULT_CONFIG = {
   publicBaseUrl: '',
   exposeCatalog: false,    // true 时 /v1/models 合并完整目录模型（默认仅订阅模型）
   upstreamBase: 'https://api.cline.bot/api/v1',
-  accounts: [],            // { name, key, enabled } —— Cline Pass 账号池
-  accountMode: 'single',   // single=手动指定 | roundrobin=轮询
-  activeAccount: 0,        // single 模式下使用的账号下标
+  accounts: [],            // { name, key, enabled } —— Cline Pass 账号池：启用的账号按请求轮询
   knownModels: [
     'cline-pass/glm-5.3-flash',
     'cline-pass/kimi-k3',
@@ -46,11 +44,14 @@ const DEFAULT_CONFIG = {
     'cline-pass/qwen3.7-max',
   ],
   // modelId -> { upstreams: string[]（有序优先列表，空=自动）, exclude: string[]（排除列表，优先级高于勾选）,
-  //              pinMode: 'strict'|'preferred', sort: 'cost'|'ttft'|'tps'|null, retries: 1..5（每个渠道的尝试次数） }
+  //              pinMode: 'strict'|'preferred', sort: 'cost'|'ttft'|'tps'|null, retries: 1..5（每个渠道的尝试次数）,
+  //              officialOnly: boolean（只使用命中官方渠道的 key）, officialProviders: string[]（官方渠道 slug，空=按 canonicalSlug 自动推断） }
   // 请求按 upstreams 顺序逐个钉住尝试：同一渠道先重试 retries 次（默认 1 = 不重试），仍失败才顺切下一个，
   // 全部失败才把最后一个错误透传给客户端；exclude 中的上游永不被使用（自动模式下注入排除偏好）。
   // 确定性错误（不可钉 / key 失效）不浪费重试次数，直接跳到下一个渠道。
   // upstream 为旧版单上游兼容镜像（取列表第一个），maxRetries 已退役（旧值仅作回滚兼容保留在文件里）。
+  // officialOnly：同一模型在不同 key 下可能命中不同上游（例如官方 deepseek vs 第三方/私有渠道），
+  // 开启后只在「探测到可命中官方渠道」的 key 之间轮询；其余 key 跳过并限频复检是否恢复，另有定时全量检测兜底。
   perModel: {},
   hiddenModels: [],       // 控制台仅隐藏的前端模型 ID（纯展示偏好：不影响代理路由，/v1/models 仍照常返回）
 };
@@ -70,11 +71,16 @@ const saveMeta = () => fs.writeFileSync(META_PATH, JSON.stringify(META, null, 2)
 // 旧版单 apiKey 迁移为账号池
 if ((!Array.isArray(config.accounts) || config.accounts.length === 0) && config.apiKey) {
   config.accounts = [{ name: '默认账号', key: config.apiKey, enabled: true }];
-  config.accountMode = 'single';
-  config.activeAccount = 0;
   saveConfig();
 }
-config.accountMode = config.accountMode === 'roundrobin' ? 'roundrobin' : 'single';
+// 旧版账号策略字段（单账号 / 会话粘性）已退役：现在固定为「启用的账号按请求轮询」。
+(function dropLegacyAccountPolicy() {
+  let dirty = false;
+  for (const k of ['accountMode', 'activeAccount', 'stickyAccount']) {
+    if (k in config) { delete config[k]; dirty = true; }
+  }
+  if (dirty) saveConfig();
+})();
 
 // perModel 配置升级：旧版单 upstream 迁移为有序多上游列表（upstream 保留为回滚兼容镜像）
 (function migratePerModel() {
@@ -107,22 +113,277 @@ if (!isConfigured()) {
   console.warn('[提示] 尚未配置上游 API Key：打开控制台「账号管理」添加账号并保存即可；服务已启动。');
 }
 
-// 账号选择：roundrobin 在启用的账号间轮询；single 使用 activeAccount 指定的账号
+// 账号选择：只做一件事——在启用的账号之间按请求轮询。
+// 不提供会话粘性，也不做加权 / 最少使用数之类的负载均衡：每次请求取下一个启用账号。
+//
+// 例外是「按模型的官方渠道过滤」：某些模型（如 deepseek-v4.1-flash）在不同 key 下会被网关
+// 路由到不同上游——有的 key 走官方 deepseek，有的走第三方/私有渠道。开启 perModel[model].officialOnly 后，
+// 只在使用「已知能命中官方渠道」的 key；其余 key 在轮询到它时跳过，并顺带发起一次限频恢复探测
+// （看它是否已恢复成官方渠道），此外还有定时全量检测。
 let RR_COUNTER = 0;
 function enabledAccounts() {
   return (config.accounts || []).filter((a) => a && a.key && a.enabled !== false);
 }
-function pickAccount() {
+
+// 每模型 × 每 key 的实际路由结果存在 META.models[model].keyRouting（以 key 的 SHA-256 指纹为键，不落明文）。
+const ACCOUNT_ROUTE_REFRESH_MINUTES = Number(process.env.ACCOUNT_ROUTE_REFRESH_MINUTES ?? 15);
+const ACCOUNT_ROUTE_RECOVERY_SECONDS = Number(process.env.ACCOUNT_ROUTE_RECOVERY_SECONDS ?? 300);
+const KEY_PROBE_INFLIGHT = new Map();      // `${model}\0${fp}` -> Promise
+const KEY_FALLBACK_WARN_AT = new Map();    // modelId -> ts
+
+function accountRouteRecord(modelId, acc) {
+  if (!modelId || !acc?.key) return null;
+  return (META.models?.[modelId]?.keyRouting || {})[quotaFingerprint(acc.key)] || null;
+}
+
+// 「官方渠道」：优先用 perModel.officialProviders 显式配置；否则取 canonicalSlug 的第一段
+// （如 deepseek/deepseek-v4.1-flash → deepseek）。canonicalSlug 缺失或为私有前缀时，用模型名的第一段猜。
+function officialProvidersFor(modelId) {
+  const cfg = config.perModel?.[modelId] || {};
+  const explicit = (cfg.officialProviders || []).filter((u) => typeof u === 'string' && u);
+  if (explicit.length) return explicit;
+  const meta = META.models?.[modelId] || {};
+  const slug = String(meta.canonicalSlug || meta.openrouterSlug || '');
+  let p = slug.split('/')[0];
+  if (!p || p === 'cline-pass' || p === 'private' || p === 'openai-compatible-private') {
+    p = String(modelId).replace(/^cline-pass\//, '').split('-')[0];
+  }
+  return p ? [p] : [];
+}
+
+// 0 = 已知命中官方渠道；1 = 尚未检测 / 探测失败（未知）；2 = 已确认非官方渠道。
+function keyRouteTier(modelId, acc) {
+  const cfg = config.perModel?.[modelId] || {};
+  if (!cfg.officialOnly) return 0;
+  const official = officialProvidersFor(modelId);
+  if (!official.length) return 0;
+  const rec = accountRouteRecord(modelId, acc);
+  if (!rec || !rec.ok) return 1;
+  // 以「实际命中」为准：探测到了 provider 就直接判定。
+  // 注意不能因为凭证池（plannedProviders）里含官方渠道就放行——例如 deepseek-v4.1-flash-1017
+  // 的所有 key 池里都有 deepseek 作为后备，但有的 key（如 账号6）实际首选是 pareto，
+  // 放行会导致请求真的落到非官方渠道。
+  if (rec.provider) return official.includes(rec.provider) ? 0 : 2;
+  // 只有拿不到实际 provider 时才退回凭证池判断。
+  if ((rec.plannedProviders || []).some((p) => official.includes(p))) return 0;
+  return 2;
+}
+
+// 官方过滤是否生效 / 当前是否有可用的官方 key（用于代理入口的严格拦截）。
+function officialFilterState(modelId) {
+  const cfg = config.perModel?.[modelId] || {};
+  const official = cfg.officialOnly ? officialProvidersFor(modelId) : [];
+  if (!cfg.officialOnly || !official.length) return { active: false, ok: true, official, eligible: enabledAccounts().length, total: enabledAccounts().length };
+  const list = enabledAccounts();
+  const eligible = list.filter((a) => keyRouteTier(modelId, a) === 0);
+  return { active: true, ok: eligible.length > 0, official, eligible: eligible.length, total: list.length };
+}
+
+function keyRouteView(modelId) {
+  const cfg = config.perModel?.[modelId] || {};
+  const official = officialProvidersFor(modelId);
+  return {
+    officialOnly: !!cfg.officialOnly,
+    officialProviders: official,
+    accounts: (config.accounts || []).filter((a) => a && a.key).map((a) => {
+      const rec = accountRouteRecord(modelId, a);
+      return {
+        name: a.name,
+        enabled: a.enabled !== false,
+        tier: official.length ? keyRouteTier(modelId, a) : 0,
+        provider: rec?.provider || null,
+        canonical: rec?.canonical || null,
+        plannedProviders: rec?.plannedProviders || [],
+        ok: rec ? !!rec.ok : null,
+        error: rec?.error || null,
+        checkedAt: rec?.checkedAt || null,
+      };
+    }),
+  };
+}
+
+// 用一条最小流式请求探测该 key 在该模型下实际命中的上游（流式可规避推理模型非流式空内容导致的 500）。
+async function detectAccountRoute(modelId, acc, { timeoutMs = 45000 } = {}) {
+  const t0 = Date.now();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${config.upstreamBase}/chat/completions`, {
+      method: 'POST',
+      headers: chatHeaders(acc.key),
+      body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 32, stream: true }),
+      signal: ctrl.signal,
+    });
+    const ctype = res.headers.get('content-type') || '';
+    if (res.status !== 200 || !ctype.includes('event-stream')) {
+      const text = await res.text().catch(() => '');
+      let msg = text.slice(0, 300);
+      try { const j = JSON.parse(text); msg = errText(j?.error) || msg; } catch { /* 非 JSON 错误文本 */ }
+      return { ok: false, status: res.status, ms: Date.now() - t0, error: msg || `HTTP ${res.status}` };
+    }
+    const out = await collectStreamAsChat(res);
+    const r = parseRouting(out);
+    if (!r.pipeline) {
+      return { ok: false, status: 200, ms: Date.now() - t0, error: '未返回路由元数据（provider_metadata.gateway.routing 缺失）' };
+    }
+    const plan = r.plan || '';
+    return {
+      ok: true,
+      status: 200,
+      ms: Date.now() - t0,
+      pipeline: r.pipeline,
+      finalProvider: r.finalProvider,
+      canonicalSlug: r.canonicalSlug,
+      fallbacks: r.fallbacks,
+      plannedProviders: parsePlannedProviders(plan),
+      plan: plan.slice(0, 600),
+      error: null,
+    };
+  } catch (e) {
+    return { ok: false, status: 0, ms: Date.now() - t0, error: e.message };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 同一 model+key 的探测去重（并发请求只打一次上游）。
+function probeAccountForModel(modelId, acc, { source = 'auto', save = true, timeoutMs = 45000 } = {}) {
+  const fp = quotaFingerprint(acc.key);
+  const inflightKey = `${modelId}\u0000${fp}`;
+  const running = KEY_PROBE_INFLIGHT.get(inflightKey);
+  if (running) return running;
+  const p = (async () => {
+    const r = await detectAccountRoute(modelId, acc, { timeoutMs });
+    const meta = (META.models[modelId] ||= {});
+    const record = {
+      name: acc.name,
+      ok: !!r.ok,
+      status: r.status ?? 0,
+      provider: r.finalProvider || null,
+      canonical: r.canonicalSlug || null,
+      pipeline: r.pipeline || null,
+      plannedProviders: r.plannedProviders || [],
+      fallbacks: r.fallbacks || [],
+      plan: r.plan || '',
+      error: r.error || null,
+      ms: r.ms ?? null,
+      checkedAt: Date.now(),
+      source,
+    };
+    meta.keyRouting = { ...(meta.keyRouting || {}), [fp]: record };
+    if (save) saveMeta();
+    return { ...record, fp };
+  })().finally(() => KEY_PROBE_INFLIGHT.delete(inflightKey));
+  KEY_PROBE_INFLIGHT.set(inflightKey, p);
+  return p;
+}
+
+// 轮询跳过非官方 key 时的即时复检：限频（默认 5 分钟一次），避免每个请求都打上游。
+function scheduleAccountProbe(modelId, acc, { force = false, source = 'rotation-skip' } = {}) {
+  // ACCOUNT_ROUTE_RECOVERY_SECONDS=0 表示关闭「轮询跳过时的即时复检」（定时检测/手动检测仍可单独使用）
+  if (!force && !(ACCOUNT_ROUTE_RECOVERY_SECONDS > 0)) return null;
+  const rec = accountRouteRecord(modelId, acc);
+  const minMs = ACCOUNT_ROUTE_RECOVERY_SECONDS * 1000;
+  if (!force && rec?.checkedAt && Date.now() - rec.checkedAt < minMs) return null;
+  return probeAccountForModel(modelId, acc, { source }).catch((e) => {
+    console.warn(`[key路由] 复检 ${acc.name} × ${modelId} 失败：${e.message}`);
+    return null;
+  });
+}
+
+// 首次请求兜底：如果还有未检测的 key 且当前没有已知官方 key，先把它们探清楚再决定选谁。
+async function ensureKeyRouting(modelId) {
+  const cfg = config.perModel?.[modelId] || {};
+  if (!cfg.officialOnly) return;
+  if (!officialProvidersFor(modelId).length) return;
+  const list = enabledAccounts();
+  const unknown = list.filter((a) => !accountRouteRecord(modelId, a));
+  if (!unknown.length) return;
+  const hasOfficial = list.some((a) => keyRouteTier(modelId, a) === 0);
+  if (hasOfficial) {
+    unknown.forEach((a) => scheduleAccountProbe(modelId, a, { force: true, source: 'background' }));
+    return;
+  }
+  await Promise.all(unknown.map((a) => probeAccountForModel(modelId, a, { source: 'bootstrap', timeoutMs: 15000 }).catch(() => null)));
+}
+
+// 定时全量检测：只针对开启了 officialOnly 的模型，逐 key 探测实际命中的上游。
+async function refreshKeyRouting({ models = null, includeDisabled = false, force = true, source = 'scheduled' } = {}) {
+  const targets = models
+    ? [...new Set(models.filter(Boolean))]
+    : (config.knownModels || []).filter((id) => config.perModel?.[id]?.officialOnly);
+  if (!targets.length) return { models: [], probed: 0 };
+  const list = includeDisabled
+    ? (config.accounts || []).filter((a) => a && a.key)
+    : enabledAccounts();
+  let probed = 0;
+  for (const modelId of targets) {
+    for (let i = 0; i < list.length; i += 3) {
+      await Promise.all(list.slice(i, i + 3).map(async (acc) => {
+        const rec = accountRouteRecord(modelId, acc);
+        if (!force && rec?.checkedAt && Date.now() - rec.checkedAt < ACCOUNT_ROUTE_REFRESH_MINUTES * 60e3) return;
+        await probeAccountForModel(modelId, acc, { source, save: false }).catch(() => null);
+        probed++;
+      }));
+    }
+  }
+  saveMeta();
+  return { models: targets, probed };
+}
+
+function noteKeyFilterFallback(modelId, acc) {
+  const now = Date.now();
+  if (now - (KEY_FALLBACK_WARN_AT.get(modelId) || 0) < 60e3) return;
+  KEY_FALLBACK_WARN_AT.set(modelId, now);
+  console.warn(`[key路由] ${modelId} 没有已知可用的官方渠道 key，临时回退到非官方/未知 key：${acc.name}`);
+}
+
+// 纯轮询：每次调用取下一个启用账号。传入 modelId 时，若该模型开启了 officialOnly，
+// 则优先选已知官方 key（tier 0）→ 未检测 key（tier 1）→ 已知非官方 key（tier 2，仅兜底）。
+function pickAccount(modelId = null, { allowFallback = true } = {}) {
   const list = enabledAccounts();
   if (!list.length) return { name: '默认', key: config.apiKey || '' };
-  if (config.accountMode === 'roundrobin' && list.length > 1) {
-    const a = list[RR_COUNTER % list.length];
+  const cfg = modelId ? (config.perModel?.[modelId] || {}) : {};
+  const filterOn = !!cfg.officialOnly && officialProvidersFor(modelId).length > 0;
+  const start = RR_COUNTER % list.length;
+  if (!filterOn) {
+    const chosen = list[start];
     RR_COUNTER = (RR_COUNTER + 1) % 1000000000;
-    return a;
+    return { ...chosen };
   }
-  const byIdx = config.accounts[config.activeAccount];
-  if (byIdx && byIdx.key && byIdx.enabled !== false) return byIdx;
-  return list[0];
+  let chosen = null;
+  let chosenTier = 2;
+  const skipped = new Set();               // 本次轮询真正跳过的 key（只复检它们，不碰未经过的 key）
+  const maxPass = allowFallback ? 2 : 0;   // 严格模式只接受 tier 0（已知官方 key）
+  for (let pass = 0; pass <= maxPass && !chosen; pass++) {
+    for (let i = 0; i < list.length; i++) {
+      const acc = list[(start + i) % list.length];
+      const tier = keyRouteTier(modelId, acc);
+      if (tier !== pass) {
+        if (tier > 0) skipped.add(acc);
+        continue;
+      }
+      chosen = acc;
+      chosenTier = pass;
+      RR_COUNTER = (start + i + 1) % 1000000000;
+      break;
+    }
+  }
+  // 只对本次轮询路径上被跳过的非官方/未知 key 发起限频复检；恢复了就自动重新加入轮询。
+  for (const acc of skipped) scheduleAccountProbe(modelId, acc);
+  if (!chosen) {
+    if (!allowFallback) return null;      // 严格模式：绝不回退到非官方 / 未知 key
+    chosen = list[start];
+    chosenTier = keyRouteTier(modelId, chosen);
+    RR_COUNTER = (RR_COUNTER + 1) % 1000000000;
+  }
+  if (chosenTier > 0) noteKeyFilterFallback(modelId, chosen);
+  const rec = accountRouteRecord(modelId, chosen);
+  return {
+    ...chosen,
+    keyFilter: chosenTier === 0 ? 'official' : chosenTier === 1 ? 'unknown' : 'fallback',
+    keyProvider: rec?.provider || null,
+  };
 }
 const chatHeaders = (key) => ({
   'Content-Type': 'application/json',
@@ -276,7 +537,7 @@ function parseRouting(json) {
 // - 直连管道（OpenRouter）：provider.only → 404 错误 JSON 里的 metadata.available_providers
 // - 规划器管道（Vercel AI Gateway）：providerOptions.gateway.only → 400 错误文本里的 "Available providers are: ..."
 async function harvestAvailableProviders(modelId, pipeline) {
-  const acc = pickAccount();
+  const acc = pickAccount(modelId);
   const base = { model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 16 };
   const body = pipeline === 'planner'
     ? { ...base, providerOptions: { gateway: { only: ['__probe__'] } } }
@@ -340,7 +601,7 @@ async function verifyPin(modelId) {
   const isDirect = meta0.pipeline === 'direct';
   const pipeline = isDirect ? 'direct' : 'planner';
   const keyPath = isDirect ? 'provider' : 'providerOptions.gateway';
-  const acc = pickAccount();
+  const acc = pickAccount(modelId);
   const base = { model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 16 };
   const body = isDirect
     ? { ...base, provider: { only: ['__probe__'] } }
@@ -374,7 +635,7 @@ async function verifyPin(modelId) {
 }
 
 async function probeModel(modelId) {
-  const acc = pickAccount();
+  const acc = pickAccount(modelId);
   const t0 = Date.now();
   const body = { model: modelId, messages: [{ role: 'user', content: 'Reply with the word OK' }], max_tokens: 256 };
   const { json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, {
@@ -432,6 +693,41 @@ async function probeModel(modelId) {
   return { ok: true, ms, ...META.models[modelId] };
 }
 
+// 按账号探测同一模型：逐个账号各发一条最小流式请求，抓取该账号实际命中的上游供应商，
+// 并从规划器返回的 planningReasoning 里解析出该账号「凭证池」中的可用渠道集合。
+// 用途：把每个账号实际命中的上游可视化，并作为「仅官方渠道 key」过滤的判定依据
+// （判定与定时复检见 detectAccountRoute / refreshKeyRouting）。
+// 用流式 + collectStreamAsChat 规避推理模型非流式空内容被网关 500 的问题。
+function parsePlannedProviders(plan) {
+  const m = /System credentials planned for:\s*([^.]+)/.exec(plan || '');
+  if (!m) return [];
+  return m[1].split(/,\s*/).map((s) => s.trim()).filter((t) => /^[a-z0-9][a-z0-9-]*$/.test(t));
+}
+async function probeAccounts(modelId, { includeDisabled = false } = {}) {
+  const all = (config.accounts || []).filter((a) => a && a.key && (includeDisabled || a.enabled !== false));
+  const run = async (acc) => {
+    // 探测结果会同时写入 keyRouting，供代理按模型过滤 key 使用
+    const r = await probeAccountForModel(modelId, acc, { source: 'manual-accounts', save: false, timeoutMs: 60000 });
+    return {
+      name: acc.name, enabled: acc.enabled !== false, ok: r.ok, status: r.status, ms: r.ms,
+      pipeline: r.pipeline, finalProvider: r.provider, canonicalSlug: r.canonical,
+      fallbacks: r.fallbacks, plannedProviders: r.plannedProviders, plan: r.plan, error: r.error,
+    };
+  };
+  // 小并发（3）避免瞬时打满；账号数很少，整体仍在数秒内完成
+  const results = [];
+  for (let i = 0; i < all.length; i += 3) results.push(...await Promise.all(all.slice(i, i + 3).map(run)));
+  const groups = {};
+  for (const r of results) {
+    const key = r.ok ? (r.finalProvider || 'unknown') : `error:${r.status || 'net'}`;
+    (groups[key] ||= []).push(r.name);
+  }
+  const meta = (META.models[modelId] ||= {});
+  meta.accountRouting = { updatedAt: Date.now(), results, groups };
+  saveMeta();
+  return { model: modelId, updatedAt: Date.now(), results, groups, includeDisabled };
+}
+
 // 上游渠道可用性分类：渠道被单独钉住时的真实状态
 function classifyUpstreamError(msg) {
   const m = String(msg || '');
@@ -471,7 +767,7 @@ async function validateUpstreams(modelId) {
   const meta = META.models[modelId] || {};
   const list = meta.upstreams || [];
   const pipeline = meta.pipeline;
-  const acc = pickAccount();
+  const acc = pickAccount(modelId);
   const results = {};
   const batch = 5;
   // 规划器管道：先用非法渠道哨兵验证 only 是否仍被网关遵守。若已被忽略，逐渠道 only 校验毫无意义
@@ -562,7 +858,11 @@ async function fetchOfficialModels() {
 }
 
 function record(modelId, info) {
-  META.models[modelId] = { ...(META.models[modelId] || {}), ...info };
+  // lastProvider/lastMs 是控制台「最近命中」展示的字段。历史原因只有探测（probeModel）写它，
+  // 代理/测试请求只写 provider/ms，导致钉住后列表仍显示上一次自动探测的渠道。
+  // 这里统一以真实请求为准同步一份，失败请求（provider 为空）不覆盖上一次命中。
+  const patch = info.provider ? { ...info, lastProvider: info.provider, lastMs: info.ms } : { ...info };
+  META.models[modelId] = { ...(META.models[modelId] || {}), ...patch };
   META.history.unshift({ ts: Date.now(), model: modelId, ...info });
   if (META.history.length > 100) META.history.length = 100;
   if (info.account) {
@@ -749,6 +1049,23 @@ async function collectStreamAsChat(res) {
   return body;
 }
 
+// 探测流式首块里的错误帧。Cline 网关可能返回 200 + text/event-stream，
+// 但内容是 data: {"id":...,"choices":[],"error":{...}}——错误对象嵌在正常 chunk 里，
+// 只判断开头是否为 {"error" 会漏掉，导致错误帧被当成正常 SSE 透传。
+// 逐条解析首个数据块里的 data: 行，命中 error 字段即返回错误信息；否则返回 null（真 SSE）。
+function inspectSSEHead(text) {
+  for (const rawLine of String(text).split('\n')) {
+    const line = rawLine.trim();
+    if (!line.startsWith('data:')) continue;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === '[DONE]') continue;
+    let chunk;
+    try { chunk = JSON.parse(payload); } catch { continue; } // 分块截断/未完整：跳过，不误判
+    if (chunk && chunk.error) return errText(chunk.error) || 'stream error';
+  }
+  return null;
+}
+
 // 非流式兼容降级：Cline 网关在「模型只产出推理、content 为空且无 tool_calls」时，
 // 非流式接口会直接 500 {"error":"empty response content"}，但同一请求改走流式却 200（SSE 只含 reasoning 增量）。
 // 这里在原非流式请求报该错时自动改走流式并把 SSE 聚合成非流式结构返回，避免下游拿到 5xx。
@@ -769,9 +1086,16 @@ async function attemptStreamCompat(modelId, body, attempt, signal, acc) {
 
 // 单次向上游网关发起非流式请求；返回 { status, out, routing, netError, acc }
 // 异常（网络错误/非 JSON/非 200）不抛出，由调用方决定切换
-async function attemptOnce(modelId, body, attempt, signal) {
+async function attemptOnce(modelId, body, attempt, signal, { strictKey = false } = {}) {
   const send = injectPrefs(body, modelId, attempt);
-  const acc = pickAccount();
+  const acc = pickAccount(modelId, { allowFallback: !strictKey });
+  if (!acc) {
+    return {
+      status: 503,
+      out: { error: { message: `模型 ${modelId} 已启用「仅官方渠道 key」，当前没有可用的官方 key`, type: 'key_filter_error' } },
+      routing: {}, netError: 'no official key', acc: null,
+    };
+  }
   try {
     const res = await fetch(`${config.upstreamBase}/chat/completions`, {
       method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(send), signal,
@@ -797,6 +1121,7 @@ async function attemptOnce(modelId, body, attempt, signal) {
 // 返回 { status, out, routing, acc, trace, streamUp? } —— trace 为逐次尝试 [{ upstream, status, ms, note, try, tries }]
 async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTimeoutMs = 120000, res = null } = {}) {
   const attempts = buildAttempts(modelId, cfg);
+  const strictKey = !!cfg?.officialOnly && officialProvidersFor(modelId).length > 0;
   const trace = [];
   const t0 = Date.now();
   let last = null;
@@ -821,7 +1146,12 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
       try {
         if (stream) {
           const send = injectPrefs(body, modelId, attempt);
-          const acc = pickAccount();
+          const acc = pickAccount(modelId, { allowFallback: !strictKey });
+          if (!acc) {
+            trace.push({ upstream: attempt.upstream, status: 503, ms: 0, note: 'no official key', try: attempt.try, tries: attempt.tries });
+            last = { status: 503, out: { error: { message: `模型 ${modelId} 已启用「仅官方渠道 key」，当前没有可用的官方 key`, type: 'key_filter_error' } }, routing: {}, acc: null, netError: null };
+            break;
+          }
           let up = null;
           let netError = null;
           try {
@@ -830,22 +1160,36 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
           const ctype = up?.headers?.get('content-type') || '';
           let isSSE = !!up && up.status === 200 && ctype.includes('event-stream');
           // 网关对流式错误可能返回 200 + text/event-stream，body 却是 {"error":...}：
-          // 读首个数据块探测，真正的 SSE 第一行是 "data: {...}" 且非纯错误对象
+          // 探测首块，真正的 SSE 第一行是 "data: {...}" 且非错误对象。
+          // 注意：错误帧可能较大，单次 read 只截到半行会导致 JSON 解析不完整而漏判，
+          // 因此读到出现换行（首个完整 SSE 事件）或达到上限为止。
+          const SSE_HEAD_MAX = 64 * 1024;
           let firstChunk = null;
           if (isSSE) {
             let reader = null;
             try {
               reader = up.body.getReader();
-              const { value, done } = await reader.read();
-              if (done) {
+              const parts = [];
+              let total = 0;
+              while (total < SSE_HEAD_MAX) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                if (value?.length) {
+                  parts.push(Buffer.from(value));
+                  total += value.length;
+                  if (parts.some((b) => b.includes(10))) break; // 已出现换行，足够判定首个事件
+                }
+              }
+              if (!parts.length) {
                 isSSE = false;
                 netError = 'empty stream';
               } else {
-                firstChunk = Buffer.from(value);
+                firstChunk = Buffer.concat(parts);
                 const head = firstChunk.toString('utf8').trimStart().slice(0, 200);
                 if (head.startsWith('data:')) {
-                  const payload = head.replace(/^data:\s*/, '').slice(0, 160);
-                  if (payload.startsWith('{"error"')) { isSSE = false; netError = `stream error: ${payload.slice(0, 120)}`; }
+                  // 错误帧形如 data: {"id":...,"choices":[],"error":{...}}，需解析 error 字段而非只看开头
+                  const streamErr = inspectSSEHead(firstChunk.toString('utf8'));
+                  if (streamErr) { isSSE = false; netError = `stream error: ${streamErr.slice(0, 160)}`; }
                 } else {
                   isSSE = false;
                   netError = `unexpected stream head: ${head.slice(0, 60)}`;
@@ -870,7 +1214,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
               text = await up.text();
             }
             try { json = JSON.parse(text); } catch {}
-            const msg = errText(json?.error) || text.slice(0, 160) || netError;
+            const msg = errText(json?.error) || netError || text.slice(0, 160);
             trace.push({ upstream: attempt.upstream, status: up.status, ms, note: msg.slice(0, 160), try: attempt.try, tries: attempt.tries });
             if (attempt.upstream) learnUpstreamStatus(modelId, attempt.upstream, msg);
             if (!attempt.upstream && (attempt.excludeList || []).length) learnAvailableProviders(modelId, msg);
@@ -879,7 +1223,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
             const u = json ? unwrap(json) : null;
             last = u
               ? { status: u.status, out: u.body, routing: u.routing, acc, netError: null }
-              : { status: 502, out: { error: { message: text.slice(0, 400) || netError, type: 'upstream_error' } }, routing: {}, acc, netError: null };
+              : { status: 502, out: { error: { message: netError || text.slice(0, 400) || 'stream error', type: 'upstream_error' } }, routing: {}, acc, netError: null };
             // 无 error 的完整 JSON 就是一次成功应答，不要再重试/换渠道
             if (last.status === 200) break;
             continue; // 错误：还未向客户端写任何字节，可切换下一候选
@@ -895,7 +1239,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
           return { status: 200, streamUp: up, streamHead: firstChunk, acc, trace, t0 };
         }
         // 非流式
-        const r = await attemptOnce(modelId, body, attempt, ctrl.signal);
+        const r = await attemptOnce(modelId, body, attempt, ctrl.signal, { strictKey });
         const ms = Date.now() - t1;
         const note = r.compat ? `${r.compat} (upstream empty content compat)` : (r.netError || (r.status !== 200 ? errText(r.out?.error?.message).slice(0, 160) : 'ok'));
         trace.push({ upstream: attempt.upstream, status: r.status, ms, note, try: attempt.try, tries: attempt.tries });
@@ -927,6 +1271,17 @@ async function handleChat(req, res) {
   const cfg = config.perModel[modelId] || {};
   const targets = [...new Set(buildAttempts(modelId, cfg).map((a) => a.upstream).filter(Boolean))];
   const isStream = !!body.stream;
+  // 开启「仅官方渠道 key」的模型：首次请求前先把未检测的 key 探清楚（没有已知官方 key 时才等待）
+  await ensureKeyRouting(modelId);
+  const kf = officialFilterState(modelId);
+  if (kf.active && !kf.ok) {
+    // 严格模式：没有可用的官方 key 时直接报错，绝不回退到非官方 key。
+    // 同时触发一轮复检，key 恢复后下一个请求即可自动继续。
+    enabledAccounts().forEach((a) => scheduleAccountProbe(modelId, a, { source: 'no-official' }));
+    const msg = `模型 ${modelId} 启用了「仅使用命中官方渠道的 key」，但当前没有可用的官方 key（官方渠道：${kf.official.join(', ')}；已启用 key ${kf.total} 个）`;
+    record(modelId, { provider: null, canonical: null, ms: 0, stream: isStream, attempts: [], trace: [], error: msg, account: null, keyFilter: 'no-official' });
+    return sendJSON(res, 503, { error: { message: msg, type: 'key_filter_error' } }, { 'X-Cline-Key-Filter': 'no-official' });
+  }
 
   const chain = await runChatChain(req, body, modelId, cfg, { stream: isStream, res });
 
@@ -944,6 +1299,8 @@ async function handleChat(req, res) {
       'X-Cline-Target-Upstream': targets.length ? targets.join('>') : 'auto',
       'X-Cline-Attempts': String(chain.trace.length),
       'X-Cline-Account': headerSafe(acc.name),
+      'X-Cline-Key-Filter': config.perModel[modelId]?.officialOnly ? (acc.keyFilter || 'unknown') : 'off',
+      'X-Cline-Key-Route': headerSafe(acc.keyProvider || 'unknown'),
     });
     if (chain.streamHead) res.write(chain.streamHead);
     const buf = [];
@@ -976,7 +1333,7 @@ async function handleChat(req, res) {
           const cfgNow = config.perModel[modelId] || {};
           if (okAttempt?.upstream) notePinOutcome(modelId, { upstream: okAttempt.upstream, strict: (cfgNow.pinMode || 'strict') === 'strict' }, { pipeline: 'planner', finalProvider: provider });
         }
-        record(modelId, { provider, canonical, ms: Date.now() - t0, stream: true, error: null, account: acc.name, attempts: chain.trace.map((t) => t.upstream || 'auto'), trace: chain.trace });
+        record(modelId, { provider, canonical, ms: Date.now() - t0, stream: true, error: null, account: acc.name, keyProvider: acc.keyProvider || null, keyFilter: acc.keyFilter || null, attempts: chain.trace.map((t) => t.upstream || 'auto'), trace: chain.trace });
         cb();
       },
     });
@@ -1000,6 +1357,8 @@ async function handleChat(req, res) {
     trace: chain.trace,
     error: status !== 200 ? out?.error?.message || null : null,
     account: acc ? acc.name : null,
+    keyProvider: acc?.keyProvider || null,
+    keyFilter: acc?.keyFilter || null,
   });
   res.writeHead(status, {
     'Content-Type': 'application/json',
@@ -1009,13 +1368,15 @@ async function handleChat(req, res) {
     'X-Cline-Canonical-Model': routing.canonicalSlug || '',
     'X-Cline-Attempts': String(chain.trace.length),
     'X-Cline-Account': headerSafe(acc ? acc.name : ''),
+    'X-Cline-Key-Filter': config.perModel[modelId]?.officialOnly ? (acc?.keyFilter || 'unknown') : 'off',
+    'X-Cline-Key-Route': headerSafe(acc?.keyProvider || 'unknown'),
   });
   res.end(JSON.stringify(out));
 }
 
 // ---------- HTTP 服务 ----------
-function sendJSON(res, status, obj) {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
+function sendJSON(res, status, obj, headers = {}) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*', ...headers });
   res.end(JSON.stringify(obj));
 }
 
@@ -1051,7 +1412,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && p === '/api/models') {
       const cat = await catalog();
-      const sub = config.knownModels.map((id) => ({ id, config: config.perModel[id] || {}, meta: META.models[id] || null }));
+      const sub = config.knownModels.map((id) => ({ id, config: config.perModel[id] || {}, meta: META.models[id] || null, keyFilter: keyRouteView(id) }));
       // 汇总钉住失效告警：planner 管道官方已忽略 providerOptions.gateway.only 的模型
       const alerts = [];
       for (const id of config.knownModels) {
@@ -1067,6 +1428,26 @@ const server = http.createServer(async (req, res) => {
       if (!model) return sendJSON(res, 400, { error: 'model required' });
       const r = await probeModel(model);
       return sendJSON(res, r.ok ? 200 : 502, r);
+    }
+    if (req.method === 'POST' && p === '/api/probe-accounts') {
+      // 账号维度探测：同一模型在账号池中每个账号下实际命中的上游供应商
+      const { model, includeDisabled } = await JSON.parse(await readBody(req).then((b) => b.toString()));
+      if (!model) return sendJSON(res, 400, { error: { message: 'model required' } });
+      if (!(config.accounts || []).some((a) => a && a.key && (includeDisabled || a.enabled !== false))) {
+        return sendJSON(res, 400, { error: { message: '没有可探测的账号（检查是否已启用或勾选「包含未启用账号」）' } });
+      }
+      const r = await probeAccounts(model, { includeDisabled: !!includeDisabled });
+      return sendJSON(res, 200, { ok: true, ...r });
+    }
+    if (req.method === 'POST' && p === '/api/key-routing') {
+      // 立即检测某模型下每个 key 实际命中的上游，并刷新「仅官方渠道 key」的判定结果
+      const { model, includeDisabled } = await JSON.parse(await readBody(req).then((b) => b.toString()));
+      if (!model) return sendJSON(res, 400, { error: { message: 'model required' } });
+      if (!(config.accounts || []).some((a) => a && a.key && (includeDisabled || a.enabled !== false))) {
+        return sendJSON(res, 400, { error: { message: '没有可检测的账号（检查是否已启用）' } });
+      }
+      const r = await refreshKeyRouting({ models: [model], includeDisabled: !!includeDisabled, force: true, source: 'manual' });
+      return sendJSON(res, 200, { ok: true, probed: r.probed, updatedAt: Date.now(), ...keyRouteView(model) });
     }
     if (req.method === 'POST' && p === '/api/check-pin') {
       // 零 token 哨兵：判断 providerOptions.gateway.only 是否仍被网关遵守（专治静默失效）
@@ -1086,6 +1467,12 @@ const server = http.createServer(async (req, res) => {
       if (exclude !== undefined) cfg.exclude = exclude;
       if (retries !== undefined) cfg.retries = retries;
       const body = { model, messages: [{ role: 'user', content: 'Reply with the word OK' }], max_tokens: 256 };
+      await ensureKeyRouting(model);
+      const kfs = officialFilterState(model);
+      if (kfs.active && !kfs.ok) {
+        enabledAccounts().forEach((a) => scheduleAccountProbe(model, a, { source: 'no-official' }));
+        return sendJSON(res, 200, { ok: false, error: `没有可用的官方渠道 key（官方渠道：${kfs.official.join(', ')}），已拒绝回退到非官方 key`, targets: (cfg.upstreams || []).filter(Boolean), exclude: cfg.exclude || [], trace: [] });
+      }
       const chain = await runChatChain(req, body, model, cfg, { stream: false, attemptTimeoutMs: 180000, res });
       const trace = chain.trace || [];
       if (chain.status !== 200) {
@@ -1095,7 +1482,7 @@ const server = http.createServer(async (req, res) => {
         });
       }
       const r = parseRouting(chain.out);
-      record(model, { provider: r.finalProvider, canonical: r.canonicalSlug, ms: Date.now() - t0, stream: false, attempts: trace.map((t) => t.upstream || 'auto'), trace, error: null, account: chain.acc?.name || null });
+      record(model, { provider: r.finalProvider, canonical: r.canonicalSlug, ms: Date.now() - t0, stream: false, attempts: trace.map((t) => t.upstream || 'auto'), trace, error: null, account: chain.acc?.name || null, keyProvider: chain.acc?.keyProvider || null, keyFilter: chain.acc?.keyFilter || null });
       return sendJSON(res, 200, {
         ok: true, ms: Date.now() - t0,
         targets: (cfg.upstreams || []).filter(Boolean), exclude: cfg.exclude || [],
@@ -1107,8 +1494,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && p === '/api/accounts') {
       return sendJSON(res, 200, {
         accounts: (config.accounts || []).map((a) => ({ ...a, quota: quotaFor(a) })),
-        mode: config.accountMode,
-        active: config.activeAccount,
+        rotation: 'roundrobin',   // 仅按请求轮询，无会话粘性 / 无其它负载均衡策略
         stats: META.stats || {},
       });
     }
@@ -1123,12 +1509,12 @@ const server = http.createServer(async (req, res) => {
         .filter((a) => a.key);
       if (!accs.length) return sendJSON(res, 400, { error: { message: '至少需要一个有效账号（key 非空）' } });
       config.accounts = accs;
-      config.accountMode = body.mode === 'roundrobin' ? 'roundrobin' : 'single';
-      config.activeAccount = Math.min(Math.max(0, Number(body.active) || 0), accs.length - 1);
       saveConfig();
       RR_COUNTER = 0;
       refreshQuotas().catch(() => {}); // 保存后后台刷新额度，不阻塞响应
-      return sendJSON(res, 200, { ok: true, accounts: config.accounts.length, mode: config.accountMode, active: config.activeAccount });
+      // 新增/换 key 后，对开启了「仅官方渠道 key」的模型重新检测
+      refreshKeyRouting({ source: 'accounts-save' }).catch(() => {});
+      return sendJSON(res, 200, { ok: true, accounts: config.accounts.length, rotation: 'roundrobin' });
     }
     if (req.method === 'POST' && p === '/api/accounts/test') {
       const { key } = JSON.parse(await readBody(req).then((b) => b.toString()));
@@ -1191,6 +1577,7 @@ const server = http.createServer(async (req, res) => {
         saveConfig();
       }
       if (body.perModel) {
+        const keyFilterChanged = [];
         for (const [m, c] of Object.entries(body.perModel)) {
           const normalize = (v) => [...new Set((Array.isArray(v) ? v : []).map((s) => String(s).trim()).filter(Boolean))].slice(0, 10);
           let upstreams = normalize(c.upstreams);
@@ -1198,6 +1585,7 @@ const server = http.createServer(async (req, res) => {
           const excl = new Set(exclude);
           upstreams = upstreams.filter((u) => !excl.has(u)); // 同时出现以 exclude 为准
           const upstream = upstreams[0] || null; // 旧字段兼容镜像
+          const officialOnly = !!c.officialOnly;
           config.perModel[m] = {
             upstream,
             upstreams,
@@ -1205,9 +1593,14 @@ const server = http.createServer(async (req, res) => {
             pinMode: c.pinMode === 'preferred' ? 'preferred' : 'strict',
             sort: ['cost', 'ttft', 'tps'].includes(c.sort) ? c.sort : null,
             retries: normRetries(c.retries),
+            officialOnly,
+            officialProviders: normalize(c.officialProviders).slice(0, 5),
           };
+          if (officialOnly) keyFilterChanged.push(m);
         }
         saveConfig();
+        // 刚开启过滤的模型：后台立即做一次 key 路由检测，避免首个请求等待
+        if (keyFilterChanged.length) refreshKeyRouting({ models: keyFilterChanged, source: 'config' }).catch(() => {});
       }
       return sendJSON(res, 200, { ok: true });
     }
@@ -1263,4 +1656,21 @@ if (Number.isFinite(MODELS_REFRESH_HOURS) && MODELS_REFRESH_HOURS > 0) {
 if (Number.isFinite(QUOTA_REFRESH_MINUTES) && QUOTA_REFRESH_MINUTES > 0) {
   setTimeout(() => refreshQuotas().catch(() => {}), 1500).unref();
   setInterval(() => refreshQuotas().catch(() => {}), QUOTA_REFRESH_MINUTES * 60 * 1000).unref();
+}
+
+// ---------- 按 key 的路由定时检测 ----------
+// 只检测开启了「仅官方渠道 key」（perModel[].officialOnly）的模型：逐 key 发一条最小流式请求，
+// 记录该 key 当前实际命中的上游。用于自动发现 key 从非官方恢复为官方（或反过来），
+// 无需人工点「检测 key 路由」。设 ACCOUNT_ROUTE_REFRESH_MINUTES=0 可关闭。
+if (Number.isFinite(ACCOUNT_ROUTE_REFRESH_MINUTES) && ACCOUNT_ROUTE_REFRESH_MINUTES > 0) {
+  setTimeout(() => {
+    refreshKeyRouting({ source: 'startup' })
+      .then((r) => { if (r.models.length) console.log(`[key路由] 启动检测完成：${r.models.length} 个模型 / ${r.probed} 次探测`); })
+      .catch((e) => console.warn(`[key路由] 启动检测失败（不影响服务）：${e.message}`));
+  }, 4000).unref();
+  setInterval(() => {
+    refreshKeyRouting({ source: 'scheduled' })
+      .then((r) => { if (r.models.length) console.log(`[key路由] 定时检测完成：${r.models.length} 个模型 / ${r.probed} 次探测`); })
+      .catch((e) => console.warn(`[key路由] 定时检测失败（不影响服务）：${e.message}`));
+  }, ACCOUNT_ROUTE_REFRESH_MINUTES * 60 * 1000).unref();
 }

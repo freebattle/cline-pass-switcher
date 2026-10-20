@@ -11,7 +11,9 @@
 - 🧬 **多上游优先级故障转移（2026-09-06 新增）** —— 勾选多个上游即按勾选顺序逐个尝试：第一个异常（报错 / 网络失败 / 超时）自动顺切下一个，全部失败才透传错误；每次尝试有独立 120s 超时与逐次尝试明细（请求头 X-Cline-Target-Upstream: a>b 与 X-Cline-Attempts，历史与测试台展示逐次尝试路径 upstream(502) 到 upstream(200)）
 - 🔁 **同渠道重试** —— 每个渠道可设 1/2/3/5 次尝试：失败先原地重试（递增退避 0.4~1.5s）用完次数才换下一个渠道，只钉一个渠道时同样生效；不可钉/key 失效这类确定性错误不消耗重试次数；尝试序列按「渠道×次数」展示
 - 🚫 **上游排除** —— 勾「排除」的渠道永不被使用：勾选模式下从候选中剔除；自动模式与优先+回退模式下把排除换算成 only 白名单（已知上游 - 排除项）注入，两类管道均实测生效；网关侧渠道清单更新导致白名单过期时，报错中附带的最新渠道清单会被自动学习合并
-- 👥 **账号池** —— 多账号管理、手动切换、轮询均衡、逐账号连通性测试与用量统计
+- 👥 **账号池（纯轮询）** —— 多账号管理，启用的账号严格按请求轮询；不提供会话粘性、加权、最少使用数等额外负载均衡策略
+- 🎯 **按模型的 key 路由过滤（2026-10 新增）** —— 同一模型在不同 key 下可能被路由到不同上游（如 `deepseek-v4.1-flash` 有的 key 走官方 `deepseek`，有的走第三方/私有渠道）。在模型行勾选「仅使用命中官方渠道的 key」后，只在这个模型的官方 key 之间轮询，非官方 key 自动跳过；跳过时即时复检、另有定时全量检测，key 恢复成官方渠道后自动重新加入
+- 🎯 **按账号探测上游** —— 对任一模型逐账号探测实际命中的上游供应商与各自凭证池（`POST /api/probe-accounts`），结果落库到 `META.models[id].accountRouting`；用于发现「同一模型、不同账号走不同供应商」并据此给账号分组
 - 📊 **观测** —— 每条请求自动记录实际命中的渠道、背后模型、耗时（含流式）
 - 🔑 **代理密钥** —— 给下游客户端发一把独立密钥，可随时在页面轮换
 - 🌐 **OpenAI 兼容** —— 任何 OpenAI 客户端 / Cline 扩展把 Base URL 指向代理即可，无侵入
@@ -82,6 +84,8 @@ location / {
 |---|---|
 | `CLINE_PASS_KEY` | 上游 Cline Pass API Key（无 config 时自动创建账号） |
 | `PROXY_KEY` | 下游代理密钥（客户端访问代理的凭据） |
+| `ACCOUNT_ROUTE_REFRESH_MINUTES` | 按 key 路由检测周期（分钟，默认 `15`，`0` = 关闭）；只检测开启了 `officialOnly` 的模型 |
+| `ACCOUNT_ROUTE_RECOVERY_SECONDS` | 轮询跳过非官方 key 时的即时复检最小间隔（秒，默认 `300`，`0` = 关闭即时复检；定时检测仍独立生效） |
 | `PUBLIC_BASE_URL` | 门户展示的公网代理地址，如 `https://pass.example.com` |
 | `PORT` / `BIND_HOST` / `DATA_DIR` | 端口 / 绑定地址（容器内为 0.0.0.0）/ 配置目录 |
 
@@ -93,15 +97,15 @@ location / {
 
 | 字段 | 说明 |
 |---|---|
-| `accounts` | 账号池：`[{ name, key, enabled }]` |
-| `accountMode` | `single` 手动指定 / `roundrobin` 轮询 |
-| `activeAccount` | 单账号模式下使用的下标 |
+| `accounts` | 账号池：`[{ name, key, enabled }]`；启用的账号按请求轮询（无会话粘性、无其它均衡策略） |
 | `proxyKey` | 下游代理密钥；空 = 不鉴权 |
 | `publicBaseUrl` | 公网代理地址（控制台展示用） |
 | `exposeCatalog` | `true` 时代理的 `/v1/models` 会合并 Cline 公开目录模型；默认 `false` 只返回订阅模型（避免客户端模型列表被淹没） |
 | `knownModels` | 订阅模型清单（控制台主表） |
 | `perModel` | 每模型的钉住配置：`{ upstreams, exclude, pinMode: strict|preferred, sort: cost|ttft|tps, retries: 1..5 }` |
 | `perModel[].retries` | 同一渠道的尝试次数，默认 `1`（不重试）；多渠道时为「当前渠道试完 retries 次再换下一个」 |
+| `perModel[].officialOnly` | `true` 时该模型只使用「探测到可命中官方渠道」的 key（默认 `false`） |
+| `perModel[].officialProviders` | 官方渠道 slug 列表，如 `["deepseek"]`；留空则按模型 `canonicalSlug` 的第一段自动推断 |
 | `apiKey` | 旧版单 key 字段，启动时自动迁移进 `accounts` |
 
 ---
@@ -159,24 +163,62 @@ Cline 会静默变更规划器行为：某些模型的 `providerOptions.gateway.
 
 ---
 
+## 按模型的 key 路由过滤（官方渠道 key）
+
+同一模型在不同 Cline Pass key 下可能被网关路由到不同上游。典型例子是 `cline-pass/deepseek-v4.1-flash`：
+有的 key 命中官方 `deepseek`，有的 key 命中私有/第三方渠道（`openai-compatible-private` 等）。
+此时如果纯轮询，一部分请求会落到非官方渠道。开启该模型的 `officialOnly` 后：
+
+1. **检测**：对每个启用的 key 发一条 `max_tokens=32` 的最小流式请求，从响应元数据读取
+   `finalProvider` 与规划器返回的 `plannedProviders`（该 key 凭证池里可用的渠道集合）。
+2. **判定**：以 key 的**实际命中渠道**（`finalProvider`）为准，命中官方渠道才算「官方 key」；
+   只有探测不到实际 provider 时才退回看凭证池（`plannedProviders`）。仅凭「凭证池里有官方渠道」不算数——
+   例如 `deepseek-v4.1-flash-1017` 的所有 key 池里都含 `deepseek` 作为后备，但 `账号6` 实际首选 `pareto`，必须判为非官方。官方渠道来自
+   `perModel[].officialProviders`；留空时按模型 `canonicalSlug` 的第一段推断（如 `deepseek/deepseek-v4.1-flash` → `deepseek`）。
+3. **轮询**：仍然只是纯轮询，但该模型只在官方 key 之间轮；非官方 key 直接被跳过。
+4. **恢复检测**：
+   - 轮询到被跳过的非官方 key 时，顺带发起一次即时复检（默认每个 key 最多 5 分钟一次，`ACCOUNT_ROUTE_RECOVERY_SECONDS`）；
+   - 后台每 15 分钟对所有官方过滤模型做一次全量检测（`ACCOUNT_ROUTE_REFRESH_MINUTES`，设 `0` 关闭）；
+   - 一旦某个 key 恢复成官方渠道，下一次轮询就会自动重新使用它，无需手工操作。
+5. **严格拦截**：如果一个官方 key 都没有，代理会直接返回 `503`（`type: key_filter_error`），**不会**回退到非官方 key；
+   同时顺手触发一轮复检，key 恢复成官方渠道后下一个请求自动继续。内部诊断（探测/校验）不受此限制。
+
+检测结果按 key 的 SHA-256 指纹存放在 `metadata.json` 的 `META.models[model].keyRouting`，不落明文 key。
+控制台模型行会显示每个 key 的实际路由（`账号: deepseek ✔` / `账号: openai-compatible-private ✘`），
+可随时点「检测 key 路由」立即刷新。代理响应头也会带上本次使用的 key 路由：
+
+- `X-Cline-Key-Filter`：`off` / `official`（正常请求）；`unknown` / `fallback` 仅可能出现在内部诊断请求
+- `X-Cline-Key-Route`：本次 key 最近一次检测到的上游供应商
+
 ## 控制台功能一览
 
 | 卡片 | 功能 |
 |---|---|
-| 账号管理 | 账号池增删改、显隐密钥、逐账号连通性测试、单账号/轮询模式、用量统计、额度（5h/周/月）展示与 10 分钟自动刷新 |
+| 账号管理 | 账号池增删改、显隐密钥、逐账号连通性测试（启用账号按请求轮询）、用量统计、额度（5h/周/月）展示与 10 分钟自动刷新 |
 | 访问与安全 | 修改下游代理密钥（即时生效）、公网代理地址、鉴权开关 |
-| 订阅模型 | 背后模型 / 渠道数 / 最近实际渠道；渠道列表（带可用性标注与实测延迟，同状态内快的在前）；严格钉住 / 优先+回退；排序；每渠道尝试次数 |
+| 订阅模型 | 背后模型 / 渠道数 / 最近实际渠道；渠道列表（带可用性标注与实测延迟，同状态内快的在前）；严格钉住 / 优先+回退；排序；每渠道尝试次数；「仅使用命中官方渠道的 key」与逐 key 路由检测 |
 | 操作按钮 | 探测（刷新渠道清单）、测试（单次钉住验证）、校验（全渠道实测地图 + 延迟） |
 | 测试台 | 任选模型+渠道发一条小请求，直接看网关是否采纳 |
+| 按账号探测上游 | 对同一模型逐账号发最小流式请求，列出各账号实际命中的供应商、背后模型、凭证池与回退数，并按供应商自动分组（可勾选「包含未启用账号」）；结果同时作为模型行 key 过滤的依据 |
 | 请求历史 | 自动记录每条请求的账号、实际渠道、耗时、尝试序列（最近 100 条，含流式） |
 | 完整目录 | Cline 公开目录模型，`:free` 变体可精确钉住 |
 
 代理同时做了兼容性标准化：解包 Cline 的 `{"data":...}` 包装为标准 OpenAI 格式、错误统一为
-`{"error":{"message":...}}`、附加 `X-Cline-Target-Upstream / X-Cline-Actual-Upstream / X-Cline-Account` 等响应头。
+`{"error":{"message":...}}`、附加 `X-Cline-Target-Upstream / X-Cline-Actual-Upstream / X-Cline-Account / X-Cline-Key-Filter / X-Cline-Key-Route` 等响应头。
 
 ---
 
 ## 常见问题
+
+**Q：怎么让 `deepseek-v4.1-flash` 只走官方 DeepSeek 的 key？**
+在控制台该模型行勾选「仅使用命中官方渠道的 key」（或配置 `perModel[].officialOnly: true`、
+`perModel[].officialProviders: ["deepseek"]`），然后点一次「检测 key 路由」。之后该模型只在官方 key 之间轮询；
+非官方 key 会被跳过，并自动定时复检是否恢复。账号池对其它模型仍然全量轮询。
+
+**Q：过滤后所有 key 都非官方怎么办？**
+代理会返回 `503 key_filter_error`，并明确提示当前没有可用的官方 key（不会偷偷回退到非官方 key）；
+这类失败会以 `X-Cline-Key-Filter: no-official` 记录到请求历史。后台仍会定时/即时复检，
+一旦某个 key 恢复为官方渠道，下一个请求会自动恢复。
 
 **Q：为什么选了某个渠道会报 `invalid_request_error`？**
 部分渠道被单独钉住时会因模型 ID 映射失败，还有渠道处于共享池限流（429）状态。点该模型行的「校验」，

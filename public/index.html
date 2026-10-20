@@ -125,6 +125,15 @@
   .howto td { vertical-align: top; }
   .howto td:first-child { white-space: nowrap; color: var(--text); font-weight: 600; }
   .valsum { font-size: 11px; }
+  /* 按模型的 key 路由过滤：仅官方渠道 key */
+  .keyfilter { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 2px; font-size: 12px; color: var(--dim); }
+  .keyfilter label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+  .keyfilter b { color: var(--text); font-weight: 600; }
+  .keyroutes { display: flex; gap: 5px; flex-wrap: wrap; }
+  .keyroute { border: 1px solid var(--border); border-radius: 999px; padding: 2px 8px; font-size: 11px; color: var(--dim); white-space: nowrap; }
+  .keyroute.ok { border-color: #2c5a40; color: var(--green); }
+  .keyroute.bad { border-color: #5a2c28; color: #ff8f86; }
+  .keyroute.unknown { border-color: #4a3d22; color: var(--orange); }
 </style>
 </head>
 <body>
@@ -139,7 +148,7 @@
   </div>
 
   <h1>Cline Pass 上游控制台</h1>
-  <div class="sub">本地代理 + 观测面板 —— 枚举订阅模型背后的渠道，三种路由策略：自动 / 只用选中的（严格钉住）/ 优先选中的（失败回退），支持排除渠道与成本·首字·吞吐排序</div>
+  <div class="sub">本地代理 + 观测面板 —— 账号池固定按请求轮询（无会话粘性）；订阅模型可选只使用命中官方渠道的 key（如 deepseek-v4.1-flash 跳过非官方 key，并定时复检是否恢复）</div>
 
   <div id="noKeyBanner" class="banner" style="display:none; border-left-color: var(--red);">
     <b>尚未配置上游 API Key：</b>在下方「账号管理」添加你的 Cline Pass 账号（sk_ 开头的 key）并保存即可开始使用；也可通过 config.json 的 accounts 或环境变量 CLINE_PASS_KEY 提供。
@@ -175,11 +184,7 @@
   <div class="card">
     <h2>账号管理（Cline Pass 账号池）</h2>
     <div style="display:flex; gap:10px; align-items:center; margin-bottom:10px; flex-wrap:wrap;">
-      <label class="dim" style="font-size:13px">模式：</label>
-      <select id="accMode">
-        <option value="single">单账号（手动指定）</option>
-        <option value="roundrobin">账号池轮询</option>
-      </select>
+      <span class="dim" style="font-size:12px">账号选择：启用的账号<b>按请求轮询</b>（无会话粘性、无其它负载均衡策略）</span>
       <label class="dim" style="font-size:12px"><input type="checkbox" id="accShowKeys" onchange="toggleKeyVis()"> 显示密钥</label>
       <button class="ghost" onclick="addAccountRow()">＋ 添加账号</button>
       <button onclick="saveAccounts()">保存账号配置</button>
@@ -187,8 +192,8 @@
       <span class="dim" style="font-size:12px" id="accMsg"></span>
     </div>
     <table>
-      <thead><tr><th>使用</th><th>名称</th><th>API Key</th><th>启用</th><th>额度（5h / 周 / 月）</th><th>请求数</th><th>最近使用</th><th>操作</th></tr></thead>
-      <tbody id="accBody"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody>
+      <thead><tr><th>名称</th><th>API Key</th><th>启用</th><th>额度（5h / 周 / 月）</th><th>请求数</th><th>最近使用</th><th>操作</th></tr></thead>
+      <tbody id="accBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
     </table>
   </div>
 
@@ -253,6 +258,22 @@
       <span class="dim" style="font-size:12px">使用 max_tokens=256 的小请求，消耗极小</span>
     </div>
     <div class="result" id="testResult"></div>
+  </div>
+
+  <div class="card">
+    <h2>按账号探测上游（同一模型在各账号下实际命中的供应商）</h2>
+    <div class="dim" style="font-size:12.5px; margin:6px 0 10px">
+      不同账号的可用凭证池可能不同，导致同一模型被路由到不同上游供应商（例如官方 deepseek vs 第三方/私有渠道）。
+      这里逐一探测每个账号实际命中的上游；在模型行勾选「仅使用命中官方渠道的 key」后，非官方 key 会自动从该模型的轮询里跳过，
+      并在轮询到它时/定时复检它是否已恢复为官方渠道。
+    </div>
+    <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+      <select id="accProbeModel" style="min-width:240px"></select>
+      <label class="dim" style="font-size:12px"><input type="checkbox" id="accProbeDisabled"> 包含未启用账号</label>
+      <button onclick="probeAccountsRun(this)" id="accProbeBtn">按账号探测</button>
+      <span class="dim" style="font-size:12px" id="accProbeMsg"></span>
+    </div>
+    <div id="accProbeResult"></div>
   </div>
 
   <div class="card">
@@ -501,6 +522,61 @@ function policySnippet(s) {
   return `${key} = ${JSON.stringify(o)}`;
 }
 
+// 按模型的 key 路由过滤：只使用命中官方渠道的 key（如 deepseek 官方 vs 第三方渠道）
+function keyFilterHtml(id, s) {
+  const cfg = s.config || {};
+  const kf = s.keyFilter || { accounts: [], officialProviders: [] };
+  const official = kf.officialProviders || [];
+  const checked = !!cfg.officialOnly;
+  const chips = (kf.accounts || []).filter((a) => a.enabled).map((a) => {
+    const tier = a.tier === 0 ? 'ok' : a.tier === 2 ? 'bad' : 'unknown';
+    const prov = a.provider || (a.ok === false ? '探测失败' : '未检测');
+    const mark = tier === 'ok' ? ' ✔' : tier === 'bad' ? ' ✘' : '';
+    const title = `实际命中：${prov}${a.checkedAt ? ' · 检测于 ' + new Date(a.checkedAt).toLocaleString() : ' · 尚未检测'}${a.error ? ' · ' + a.error : ''}`;
+    return `<span class="keyroute ${tier}" title="${escapeHtml(title)}">${escapeHtml(a.name)}: ${escapeHtml(prov)}${mark}</span>`;
+  }).join('');
+  return `<div class="keyfilter">
+    <label title="开启后该模型只在「探测到可命中官方渠道」的 key 之间轮询；非官方 key 会被跳过，并在轮询到它时/定时复检是否恢复">
+      <input type="checkbox" ${checked ? 'checked' : ''} onchange="setOfficialOnly('${id}', this.checked)"> 仅使用命中官方渠道的 key
+    </label>
+    <span>官方渠道：<b>${official.length ? official.map(escapeHtml).join(' / ') : '未探测'}</b></span>
+    <button class="ghost mini" onclick="probeKeys('${id}', this)" title="立即逐 key 检测该模型实际命中的上游">检测 key 路由</button>
+    <span class="keyroutes">${chips || '<span class="dim">尚无 key 检测结果</span>'}</span>
+  </div>`;
+}
+
+async function setOfficialOnly(id, on) {
+  const s = DATA.subscription.find((x) => x.id === id);
+  if (!s) return;
+  s.config.officialOnly = on;
+  await saveModelCfg(id, { officialOnly: on });
+  if (on) {
+    status('已开启：正在检测各 key 实际命中的上游…');
+    probeKeys(id);
+  } else {
+    status('已关闭 key 路由过滤：该模型恢复为在所有启用的 key 之间轮询');
+  }
+}
+
+async function probeKeys(id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = '检测中…'; }
+  try {
+    const r = await api('/api/key-routing', { model: id });
+    if (r.ok) {
+      const s = DATA.subscription.find((x) => x.id === id);
+      if (s) { s.keyFilter = r; s.config.officialOnly = r.officialOnly; }
+      status(`key 路由检测完成（${r.probed} 个 key）`);
+      render();
+    } else {
+      status(r.error?.message || '检测失败');
+    }
+  } catch (e) {
+    status('检测失败：' + (e?.message || e));
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '检测 key 路由'; }
+  }
+}
+
 // 路由策略单元格：分段选择器 + 人话说明 + 渠道面板 + 排序 + 参数预览
 function policyCell(s) {
   const id = s.id, cfg = s.config;
@@ -512,6 +588,7 @@ function policyCell(s) {
   return `<div class="policy">
     <div class="seg">${segs}</div>
     <div class="policy-desc">${policyDesc(s)}</div>
+    ${keyFilterHtml(id, s)}
     ${upstreamPanel(id, s.meta, cfg)}
     <div class="sortline">排序偏好
       <select class="sortsel" onchange="saveCfg('${id}','sort',this.value)" ${pol === 'strict' ? 'disabled title="严格模式只允许一个渠道，排序不起作用"' : 'title="让网关按指标给渠道排序"'}>
@@ -629,6 +706,7 @@ function render() {
   const testList = visible.length ? visible : DATA.subscription;
   $('#testModel').innerHTML = testList.map((s) => `<option value="${s.id}">${shortId(s.id)}</option>`).join('');
   onTestModelChange();
+  renderAccProbe();
 
   $('#catSummary').textContent = `展开（共 ${DATA.catalogCount} 个目录模型）`;
   const of = DATA.officialFetch;
@@ -648,6 +726,71 @@ function renderCatalog() {
     <td>${m?.lastProvider ? '<span class="badge">' + m.lastProvider + '</span>' : ''}</td>
     <td><button class="ghost" onclick="probe('${id}', this)">探测</button></td></tr>`;
   }).join('') || '<tr><td class="empty">无匹配</td></tr>';
+}
+
+// 按账号探测：下拉列出订阅模型，默认选中 deepseek-v4.1-flash；展示上次落库的结果
+function renderAccProbe() {
+  const sel = $('#accProbeModel');
+  if (!sel || !DATA) return;
+  const prev = sel.value;
+  const list = (DATA.subscription || []).map((s) => s.id);
+  sel.innerHTML = list.map((id) => `<option value="${id}">${shortId(id)}</option>`).join('');
+  const fallback = list.includes('cline-pass/deepseek-v4.1-flash') ? 'cline-pass/deepseek-v4.1-flash' : list[0];
+  sel.value = list.includes(prev) ? prev : fallback;
+  const s = (DATA.subscription || []).find((x) => x.id === sel.value);
+  renderAccProbeResult(s?.meta?.accountRouting);
+}
+
+function renderAccProbeResult(res) {
+  const el = $('#accProbeResult');
+  if (!el) return;
+  if (!res || !res.results || !res.results.length) { el.innerHTML = '<div class="dim" style="margin-top:10px">尚无探测结果，点上方「按账号探测」开始</div>'; return; }
+  const groupHtml = Object.entries(res.groups || {}).map(([k, names]) => `· <b>${escapeHtml(k)}</b>：${(names || []).map(escapeHtml).join('、')}`).join('<br>');
+  const rows = res.results.map((r) => {
+    const up = r.ok ? `<span class="badge">${escapeHtml(r.finalProvider || '?')}</span>` : '<span class="badge red">失败</span>';
+    const planned = r.ok ? ((r.plannedProviders && r.plannedProviders.length) ? r.plannedProviders.join(', ') : '—') : '';
+    return `<tr>
+      <td>${escapeHtml(r.name)}</td>
+      <td>${r.enabled === false ? '<span class="dim">停用</span>' : '<span class="badge green">启用</span>'}</td>
+      <td>${up}</td>
+      <td class="mono dim">${escapeHtml(r.canonicalSlug || '—')}</td>
+      <td class="dim" style="font-size:11.5px">${r.ok ? escapeHtml(planned) : '<span class="mismatch">' + escapeHtml(r.error || '') + '</span>'}</td>
+      <td class="dim">${r.ok ? (r.fallbacks?.length ?? 0) : '—'}</td>
+      <td class="dim">${r.ok ? r.ms + ' ms' : '—'}</td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = `<div style="margin-top:12px">
+    <div class="kvs"><div>探测时间 <b>${new Date(res.updatedAt).toLocaleString()}</b></div><div>账号 <b>${res.results.length} 个</b></div></div>
+    <div style="margin-top:8px"><b>按供应商分组：</b><br>${groupHtml || '<span class="dim">无结果</span>'}</div>
+    <table style="margin-top:10px">
+      <thead><tr><th>账号</th><th>状态</th><th>实际上游</th><th>背后模型</th><th>规划可用渠道（凭证池）</th><th>回退数</th><th>耗时</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="dim" style="font-size:11.5px; margin-top:6px">提示：在模型行勾选「仅使用命中官方渠道的 key」后，非官方 key 会自动从该模型的轮询中跳过；轮询到它时与定时任务都会复检，一旦恢复为官方渠道会自动重新加入。</div>
+  </div>`;
+}
+
+async function probeAccountsRun(btn) {
+  const model = $('#accProbeModel').value;
+  if (!model) return;
+  btn.disabled = true; btn.textContent = '探测中…';
+  const msg = $('#accProbeMsg'); msg.style.color = 'var(--text)'; msg.textContent = '逐一请求各账号，约需数秒…';
+  try {
+    const r = await api('/api/probe-accounts', { model, includeDisabled: $('#accProbeDisabled').checked });
+    if (r.ok) {
+      renderAccProbeResult(r);
+      const s = (DATA.subscription || []).find((x) => x.id === model);
+      if (s) { s.meta = s.meta || {}; s.meta.accountRouting = { updatedAt: r.updatedAt, results: r.results, groups: r.groups }; }
+      msg.textContent = `完成：${r.results.length} 个账号`;
+    } else {
+      msg.style.color = 'var(--red)';
+      msg.textContent = r.error?.message || '探测失败';
+    }
+  } catch (e) {
+    msg.style.color = 'var(--red)';
+    msg.textContent = '探测失败：' + e.message;
+  }
+  btn.disabled = false; btn.textContent = '按账号探测';
 }
 
 async function loadAll() {
@@ -882,11 +1025,13 @@ async function saveModelCfg(id, patch) {
     pinMode: patch.pinMode !== undefined ? patch.pinMode : (cfg.pinMode || 'strict'),
     sort: patch.sort !== undefined ? patch.sort : (cfg.sort || null),
     retries: patch.retries !== undefined ? patch.retries : retriesOf(cfg),
+    officialOnly: patch.officialOnly !== undefined ? !!patch.officialOnly : !!cfg.officialOnly,
+    officialProviders: patch.officialProviders !== undefined ? patch.officialProviders : (cfg.officialProviders || []),
   };
   try {
     const r = await api('/api/config', { perModel: { [id]: full } });
     if (r.ok) {
-      cfg.upstreams = full.upstreams; cfg.exclude = full.exclude; cfg.pinMode = full.pinMode; cfg.sort = full.sort; cfg.retries = full.retries;
+      cfg.upstreams = full.upstreams; cfg.exclude = full.exclude; cfg.pinMode = full.pinMode; cfg.sort = full.sort; cfg.retries = full.retries; cfg.officialOnly = full.officialOnly; cfg.officialProviders = full.officialProviders;
       status(`${id} 配置已保存`);
     } else {
       status(`${id} 保存失败：${r.error?.message || '未知错误'}`);
@@ -1023,7 +1168,7 @@ async function loadHistory() {
   HIST_SIG = sig;
   $('#histBody').innerHTML = history.length ? history.map((h) => `<tr>
       <td>${fmt(h.ts)}</td><td class="mono">${shortId(h.model)}</td>
-      <td>${h.account ? '<span class="badge">' + h.account + '</span>' : '<span class="dim">—</span>'}</td>
+      <td>${h.account ? '<span class="badge">' + escapeHtml(h.account) + '</span>' + (h.keyProvider ? '<div class="dim" style="font-size:11px; margin-top:2px">' + escapeHtml(h.keyProvider) + '</div>' : '') : '<span class="dim">—</span>'}</td>
       <td>${h.provider ? '<span class="badge">' + h.provider + '</span>' : '<span class="dim">—</span>'}</td>
       <td class="mono dim">${h.canonical || '—'}</td>
       <td>${h.ms ?? '—'} ms</td>
@@ -1114,13 +1259,10 @@ function fmtQuota(q) {
 
 function renderAccounts() {
   if (!ACCS) return;
-  $('#accMode').value = ACCS.mode;
   const show = $('#accShowKeys').checked;
   const rows = ACCS.accounts.map((a, i) => {
     const st = (ACCS.stats || {})[a.name] || {};
-    const checked = ACCS.mode === 'single' && i === ACCS.active;
     return `<tr>
-      <td><input type="radio" name="accActive" data-i="${i}" ${checked ? 'checked' : ''} ${ACCS.mode !== 'single' ? 'disabled title="轮询模式下按顺序轮流使用"' : 'title="单账号模式下使用此账号"'}></td>
       <td><input class="accName" data-i="${i}" value="${escapeHtml(a.name)}" style="width:84px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 8px; font-size:12.5px"></td>
       <td><input class="accKey" data-i="${i}" type="${show ? 'text' : 'password'}" value="${escapeHtml(a.key)}" style="width:210px; min-width:0; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 8px; font-family:Consolas, monospace; font-size:12px"></td>
       <td><input type="checkbox" class="accEnabled" data-i="${i}" ${a.enabled !== false ? 'checked' : ''}></td>
@@ -1133,20 +1275,17 @@ function renderAccounts() {
       </div></td>
     </tr>`;
   }).join('');
-  $('#accBody').innerHTML = rows || '<tr><td colspan="8" class="empty">暂无账号，点击「＋ 添加账号」</td></tr>';
+  $('#accBody').innerHTML = rows || '<tr><td colspan="7" class="empty">暂无账号，点击「＋ 添加账号」</td></tr>';
 }
 
 // 把 DOM 里当前编辑值收回 ACCS（避免重渲染丢输入）
 function collectAccounts() {
-  const mode = $('#accMode').value;
   const accs = ACCS.accounts.map((a, i) => ({
     name: document.querySelector(`.accName[data-i="${i}"]`)?.value?.trim() || a.name,
     key: document.querySelector(`.accKey[data-i="${i}"]`)?.value?.trim() || '',
     enabled: document.querySelector(`.accEnabled[data-i="${i}"]`)?.checked !== false,
   }));
-  const checked = document.querySelector('input[name="accActive"]:checked');
-  const active = checked ? parseInt(checked.dataset.i) : Math.min(ACCS.active ?? 0, Math.max(0, accs.length - 1));
-  return { accounts: accs, mode, active };
+  return { accounts: accs };
 }
 
 async function saveAccounts() {
@@ -1154,7 +1293,7 @@ async function saveAccounts() {
   if (!payload.accounts.filter((a) => a.key).length) { accMsg('至少需要一个 key 非空的账号', true); return; }
   const r = await api('/api/accounts', payload);
   if (r.ok) {
-    accMsg(`已保存：${r.accounts} 个账号 · ${r.mode === 'roundrobin' ? '轮询' : '单账号'}模式`);
+    accMsg(`已保存：${r.accounts} 个账号 · 按请求轮询`);
     await loadAll();
     // 后端保存后会在后台刷新额度，稍等再拉一次以显示新账号额度
     setTimeout(() => loadAccounts().catch(() => {}), 2500);
@@ -1185,7 +1324,7 @@ async function refreshQuota(btn) {
 function addAccountRow() {
   const cur = collectAccounts();
   cur.accounts.push({ name: `账号${cur.accounts.length + 1}`, key: '', enabled: true });
-  ACCS.accounts = cur.accounts; ACCS.mode = cur.mode; ACCS.active = cur.active;
+  ACCS.accounts = cur.accounts;
   renderAccounts();
   const last = document.querySelectorAll('.accKey');
   if (last.length) last[last.length - 1].focus();
@@ -1194,7 +1333,7 @@ function addAccountRow() {
 function delAccount(i) {
   const cur = collectAccounts();
   cur.accounts.splice(i, 1);
-  ACCS.accounts = cur.accounts; ACCS.mode = cur.mode; ACCS.active = Math.min(cur.active, Math.max(0, cur.accounts.length - 1));
+  ACCS.accounts = cur.accounts;
   renderAccounts();
 }
 
@@ -1226,6 +1365,10 @@ function status(msg) { $('#status').textContent = msg; clearTimeout(statusTimer)
 
 $('#proxyBase').onclick = () => navigator.clipboard.writeText(DATA.proxyBase).then(() => status('已复制代理地址'));
 $('#testModel').addEventListener('change', onTestModelChange);
+$('#accProbeModel')?.addEventListener('change', () => {
+  const s = (DATA?.subscription || []).find((x) => x.id === $('#accProbeModel').value);
+  renderAccProbeResult(s?.meta?.accountRouting);
+});
 $('#catFilter').addEventListener('input', renderCatalog);
 $('#loginKey').addEventListener('keydown', (e) => { if (e.key === 'Enter') tryLogin(); });
 // 请求历史自动刷新默认开启（localStorage 里存 '0' 表示用户手动关过）
