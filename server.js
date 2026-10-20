@@ -204,7 +204,7 @@ function keyRouteView(modelId) {
 }
 
 // 用一条最小流式请求探测该 key 在该模型下实际命中的上游（流式可规避推理模型非流式空内容导致的 500）。
-async function detectAccountRoute(modelId, acc, { timeoutMs = 45000 } = {}) {
+async function detectAccountRoute(modelId, acc, { timeoutMs = 45000, trigger = null } = {}) {
   const t0 = Date.now();
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -220,9 +220,11 @@ async function detectAccountRoute(modelId, acc, { timeoutMs = 45000 } = {}) {
       const text = await res.text().catch(() => '');
       let msg = text.slice(0, 300);
       try { const j = JSON.parse(text); msg = errText(j?.error) || msg; } catch { /* 非 JSON 错误文本 */ }
+      noteInternal('key-route', modelId, { acc, ms: Date.now() - t0, stream: true, trigger, error: msg });
       return { ok: false, status: res.status, ms: Date.now() - t0, error: msg || `HTTP ${res.status}` };
     }
     const out = await collectStreamAsChat(res);
+    noteInternal('key-route', modelId, { acc, json: out, ms: Date.now() - t0, stream: true, trigger });
     const r = parseRouting(out);
     if (!r.pipeline) {
       return { ok: false, status: 200, ms: Date.now() - t0, error: '未返回路由元数据（provider_metadata.gateway.routing 缺失）' };
@@ -254,7 +256,7 @@ function probeAccountForModel(modelId, acc, { source = 'auto', save = true, time
   const running = KEY_PROBE_INFLIGHT.get(inflightKey);
   if (running) return running;
   const p = (async () => {
-    const r = await detectAccountRoute(modelId, acc, { timeoutMs });
+    const r = await detectAccountRoute(modelId, acc, { timeoutMs, trigger: source });
     const meta = (META.models[modelId] ||= {});
     const record = {
       name: acc.name,
@@ -543,7 +545,10 @@ async function harvestAvailableProviders(modelId, pipeline) {
   const body = pipeline === 'planner'
     ? { ...base, providerOptions: { gateway: { only: ['__probe__'] } } }
     : { ...base, provider: { only: ['__probe__'] } };
+  const t0 = Date.now();
   const { json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, { method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(body) }, 60000);
+  // 正常情况下路由层拒绝、不耗 token；only 被网关忽略时会照常生成，这时要记一笔
+  noteInternal('harvest', modelId, { acc, json, ms: Date.now() - t0, pinned: '__probe__' });
   const err = json?.error;
   if (typeof err !== 'string') return null;
   if (pipeline === 'planner') {
@@ -607,9 +612,11 @@ async function verifyPin(modelId) {
   const body = isDirect
     ? { ...base, provider: { only: ['__probe__'] } }
     : { ...base, providerOptions: { gateway: { only: ['__probe__'] } } };
+  const t0 = Date.now();
   const { status, json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, {
     method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(body),
   }, 60000).catch(() => ({ status: 0, json: { error: 'network error' } }));
+  noteInternal('pin-check', modelId, { acc, json, ms: Date.now() - t0, pinned: '__probe__' });
   const rawErr = json?.error;
   const errStr = typeof rawErr === 'string' ? rawErr : rawErr ? JSON.stringify(rawErr) : '';
   const m = /Available providers are:\s*([^.]+)/.exec(errStr);
@@ -645,6 +652,7 @@ async function probeModel(modelId) {
     body: JSON.stringify(body),
   }, 180000);
   const ms = Date.now() - t0;
+  noteInternal('probe', modelId, { acc, json, ms });
   if (json?.error && !json?.data) {
     return { ok: false, error: typeof json.error === 'string' ? json.error : JSON.stringify(json.error) };
   }
@@ -791,6 +799,7 @@ async function validateUpstreams(modelId) {
       const { json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, {
         method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(body),
       }, 60000).catch(() => ({ json: { error: 'network error' } }));
+      noteInternal('validate', modelId, { acc, json, ms: Date.now() - t0, pinned: slug });
       let status = 'unknown';
       let note = '';
       if (json?.error && !json?.data) {
@@ -858,14 +867,47 @@ async function fetchOfficialModels() {
   return { sources, found: valid.length, added, knownModels: config.knownModels, ...META.officialModelsFetch };
 }
 
+// 请求历史按来源分开限额：代理请求（客户端经代理发起）与内部请求（测试 / 探测 / 校验 / key 路由检测）。
+// 定时 key 路由检测每轮「官方过滤模型数 × 启用 key 数」条，共用一个上限会把真实请求挤出去。
+// 没有 source 字段的旧记录按代理请求算。
+const HISTORY_LIMIT = { proxy: 100, internal: 200 };
+const historyKind = (h) => (!h.source || h.source === 'proxy' ? 'proxy' : 'internal');
+function pushHistory(entry) {
+  META.history.unshift(entry);
+  const seen = { proxy: 0, internal: 0 };
+  META.history = META.history.filter((h) => ++seen[historyKind(h)] <= HISTORY_LIMIT[historyKind(h)]);
+}
+
+// 内部请求（探测、校验、测试 key 等）同样消耗账号额度，也记进请求历史，但不改模型的「最近命中」和账号统计。
+// 只记上游真正跑了模型的请求：返回了补全或 usage，或是推理耗尽 max_tokens 的 empty response；
+// 路由层直接拒绝（如 only=["__probe__"] 被拒）没有 token 消耗，不记。
+// json 是上游原始应答（非流式带 data 包裹，或 collectStreamAsChat 聚合出的结构）。
+function noteInternal(source, modelId, { acc = null, json = null, ms = null, stream = false, pinned = null, trigger = null, error = null } = {}) {
+  const d = json?.data && json.data.choices ? json.data : json;
+  const errMsg = error || (d?.error && !d?.choices ? errText(d.error) : null);
+  const ran = !!(d?.choices || d?.usage) || /empty response content/i.test(errMsg || '');
+  if (!ran) return;
+  const r = d?.choices ? parseRouting(d) : {};
+  const usage = usageMetrics(d?.usage);
+  const tps = usage ? tpsOf(usage.completion, ms) : null;
+  pushHistory({
+    ts: Date.now(), model: modelId, source, trigger, pinned,
+    provider: r.finalProvider || null, canonical: r.canonicalSlug || null,
+    ms, stream, error: errMsg ? errMsg.slice(0, 300) : null,
+    account: acc?.name || null, attempts: [], trace: [],
+    usage, ttftMs: null, tps, tpsApprox: tps != null,
+  });
+  saveMeta();
+}
+
 function record(modelId, info) {
   // lastProvider/lastMs 是控制台「最近命中」展示的字段。历史原因只有探测（probeModel）写它，
   // 代理/测试请求只写 provider/ms，导致钉住后列表仍显示上一次自动探测的渠道。
   // 这里统一以真实请求为准同步一份，失败请求（provider 为空）不覆盖上一次命中。
-  const patch = info.provider ? { ...info, lastProvider: info.provider, lastMs: info.ms } : { ...info };
+  const { source = 'proxy', ...rest } = info;
+  const patch = rest.provider ? { ...rest, lastProvider: rest.provider, lastMs: rest.ms } : { ...rest };
   META.models[modelId] = { ...(META.models[modelId] || {}), ...patch };
-  META.history.unshift({ ts: Date.now(), model: modelId, ...info });
-  if (META.history.length > 100) META.history.length = 100;
+  pushHistory({ ts: Date.now(), model: modelId, source, ...rest });
   if (info.account) {
     META.stats = META.stats || {};
     const st = (META.stats[info.account] ||= { requests: 0, lastUsed: 0, lastError: null });
@@ -1554,13 +1596,14 @@ const server = http.createServer(async (req, res) => {
       const chain = await runChatChain(req, body, model, cfg, { stream: false, attemptTimeoutMs: 180000, res });
       const trace = chain.trace || [];
       if (chain.status !== 200) {
+        record(model, { source: 'test', provider: null, canonical: null, ms: Date.now() - t0, stream: false, attempts: trace.map((t) => t.upstream || 'auto'), trace, error: (chain.out?.error?.message || 'upstream error').slice?.(0, 300) || 'upstream error', account: chain.acc?.name || null, keyProvider: chain.acc?.keyProvider || null, keyFilter: chain.acc?.keyFilter || null });
         return sendJSON(res, 200, {
           ok: false, error: (chain.out?.error?.message || 'upstream error').slice?.(0, 400) || 'upstream error',
           targets: (cfg.upstreams || []).filter(Boolean), exclude: cfg.exclude || [], trace,
         });
       }
       const r = parseRouting(chain.out);
-      record(model, { provider: r.finalProvider, canonical: r.canonicalSlug, ms: Date.now() - t0, stream: false, attempts: trace.map((t) => t.upstream || 'auto'), trace, error: null, account: chain.acc?.name || null, keyProvider: chain.acc?.keyProvider || null, keyFilter: chain.acc?.keyFilter || null, ...nonStreamMetrics(chain.out, trace) });
+      record(model, { source: 'test', provider: r.finalProvider, canonical: r.canonicalSlug, ms: Date.now() - t0, stream: false, attempts: trace.map((t) => t.upstream || 'auto'), trace, error: null, account: chain.acc?.name || null, keyProvider: chain.acc?.keyProvider || null, keyFilter: chain.acc?.keyFilter || null, ...nonStreamMetrics(chain.out, trace) });
       return sendJSON(res, 200, {
         ok: true, ms: Date.now() - t0,
         targets: (cfg.upstreams || []).filter(Boolean), exclude: cfg.exclude || [],
@@ -1605,6 +1648,9 @@ const server = http.createServer(async (req, res) => {
         headers: chatHeaders(k),
         body: JSON.stringify({ model, messages: [{ role: 'user', content: 'Say OK' }], max_tokens: 512 }),
       }, 120000);
+      // 测试的 key 可能还没保存进账号池，这时账号列显示「未保存的 key」
+      const known = (config.accounts || []).find((a) => a.key === k);
+      noteInternal('account-test', model, { acc: { name: known ? known.name : '未保存的 key' }, json, ms: Date.now() - t0 });
       if (json?.error && !json?.data) {
         const msg = typeof json.error === 'string' ? json.error : JSON.stringify(json.error);
         const authFail = /unauthorized|re-authenticate|invalid\s*api|401/i.test(msg);

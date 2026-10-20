@@ -281,12 +281,19 @@
 
   <div class="card">
     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-      <h2 style="margin:0">请求历史（最近 100 条，经代理的请求自动记录）</h2>
-      <label class="dim" style="font-size:13px" title="开启后每 5 秒静默拉取一次，只有内容变化才重绘；页面切到后台时自动暂停"><input type="checkbox" id="histAuto" onchange="toggleHistAuto(this.checked)"> 每 5 秒自动刷新</label>
+      <h2 style="margin:0">请求历史（所有消耗 token 的请求：代理请求保留最近 100 条，测试 / 探测 / 校验等内部请求另保留 200 条）</h2>
+      <div style="display:flex; align-items:center; gap:12px;">
+        <select id="histFilter" onchange="setHistFilter(this.value)" title="代理请求 = 客户端经代理发起；内部请求 = 控制台测试、探测、校验、测试 key，以及后台的 key 路由检测">
+          <option value="all">全部</option>
+          <option value="proxy">只看代理请求</option>
+          <option value="internal">只看内部请求</option>
+        </select>
+        <label class="dim" style="font-size:13px" title="开启后每 5 秒静默拉取一次，只有内容变化才重绘；页面切到后台时自动暂停"><input type="checkbox" id="histAuto" onchange="toggleHistAuto(this.checked)"> 每 5 秒自动刷新</label>
+      </div>
     </div>
     <table>
-      <thead><tr><th>时间</th><th>模型</th><th>账号</th><th>实际上游</th><th>背后模型</th><th>耗时</th><th title="输入 prompt tokens；下方小字为输出 tokens">上下文</th><th title="缓存命中 tokens / 输入 tokens">缓存命中</th><th title="首 token 时间：从代理收到请求到第一个内容 / 推理 / 工具调用增量（含故障转移耗时）；仅流式">TTFT</th><th title="生成速度：输出 tokens / (结束 - 首 token)；≈ 为非流式按整段耗时估算">TPS</th><th>方式</th><th>尝试序列</th></tr></thead>
-      <tbody id="histBody"><tr><td colspan="12" class="empty">暂无记录</td></tr></tbody>
+      <thead><tr><th>时间</th><th>来源</th><th>模型</th><th>账号</th><th>实际上游</th><th>背后模型</th><th>耗时</th><th title="输入 prompt tokens；下方小字为输出 tokens">上下文</th><th title="缓存命中 tokens / 输入 tokens">缓存命中</th><th title="首 token 时间：从代理收到请求到第一个内容 / 推理 / 工具调用增量（含故障转移耗时）；仅流式">TTFT</th><th title="生成速度：输出 tokens / (结束 - 首 token)；≈ 为非流式按整段耗时估算">TPS</th><th>方式</th><th>尝试序列 / 备注</th></tr></thead>
+      <tbody id="histBody"><tr><td colspan="13" class="empty">暂无记录</td></tr></tbody>
     </table>
   </div>
 
@@ -1166,11 +1173,13 @@ function bulkUp(id, action) {
 async function loadHistory() {
   const { history } = await api('/api/history');
   // 内容未变化时跳过重绘，避免每 5 秒自动刷新时表格闪烁 / 丢失滚动位置
-  const sig = JSON.stringify(history);
+  const sig = $('#histFilter').value + JSON.stringify(history);
   if (sig === HIST_SIG) return;
   HIST_SIG = sig;
-  $('#histBody').innerHTML = history.length ? history.map((h) => `<tr>
-      <td>${fmt(h.ts)}</td><td class="mono">${shortId(h.model)}</td>
+  const filter = $('#histFilter').value;
+  const rows = filter === 'all' ? history : history.filter((h) => (isProxyEntry(h) ? 'proxy' : 'internal') === filter);
+  $('#histBody').innerHTML = rows.length ? rows.map((h) => `<tr>
+      <td>${fmt(h.ts)}</td><td>${sourceCell(h)}</td><td class="mono">${shortId(h.model)}</td>
       <td>${h.account ? '<span class="badge">' + escapeHtml(h.account) + '</span>' + (h.keyProvider ? '<div class="dim" style="font-size:11px; margin-top:2px">' + escapeHtml(h.keyProvider) + '</div>' : '') : '<span class="dim">—</span>'}</td>
       <td>${h.provider ? '<span class="badge">' + h.provider + '</span>' : '<span class="dim">—</span>'}</td>
       <td class="mono dim">${h.canonical || '—'}</td>
@@ -1180,8 +1189,40 @@ async function loadHistory() {
       <td class="num">${h.ttftMs == null ? DASH : `<span class="mt ${msCls(h.ttftMs)}">${msLabel(h.ttftMs)}</span>`}</td>
       <td class="num">${tpsCell(h)}</td>
       <td>${h.stream ? '流式' : '非流式'}</td>
-      <td class="dim">${historyTrace(h) || '—'}</td>
-    </tr>`).join('') : '<tr><td colspan="12" class="empty">暂无记录 —— 把客户端 Base URL 指向代理地址即可自动记录</td></tr>';
+      <td class="dim">${historyTrace(h) || internalNote(h) || '—'}</td>
+    </tr>`).join('') : `<tr><td colspan="13" class="empty">${history.length ? '当前筛选下没有记录' : '暂无记录 —— 把客户端 Base URL 指向代理地址即可自动记录'}</td></tr>`;
+}
+
+// 请求来源：代理请求（客户端经代理发起）之外，测试 / 探测 / 校验 / key 路由检测也消耗额度，一并记录。
+// 旧记录没有 source 字段，按代理请求显示。
+const SOURCE_LABEL = {
+  proxy: '代理', test: '测试', probe: '探测', harvest: '渠道清单', 'pin-check': '检测钉住',
+  validate: '校验', 'key-route': 'key 路由', 'account-test': '测试 key',
+};
+const TRIGGER_LABEL = {
+  scheduled: '定时', startup: '启动', manual: '手动', 'manual-accounts': '按账号探测', 'rotation-skip': '轮询复检',
+  'no-official': '无官方 key 复检', background: '后台补测', bootstrap: '首次请求', 'accounts-save': '保存账号',
+  config: '改配置', auto: '自动',
+};
+const isProxyEntry = (h) => !h.source || h.source === 'proxy';
+function sourceCell(h) {
+  const src = h.source || 'proxy';
+  const label = SOURCE_LABEL[src] || src;
+  const trig = h.trigger ? `<div class="dim" style="font-size:11px; margin-top:2px">${escapeHtml(TRIGGER_LABEL[h.trigger] || h.trigger)}</div>` : '';
+  return `<span class="badge${isProxyEntry(h) ? '' : ' orange'}">${escapeHtml(label)}</span>${trig}`;
+}
+// 内部请求没有尝试序列：显示钉住的渠道和错误
+function internalNote(h) {
+  if (isProxyEntry(h)) return '';
+  const parts = [];
+  if (h.pinned) parts.push(`钉 ${escapeHtml(h.pinned)}`);
+  if (h.error) parts.push(`<span class="mismatch" title="${escapeHtml(h.error)}">${escapeHtml(h.error.slice(0, 60))}</span>`);
+  return parts.join(' · ');
+}
+function setHistFilter(v) {
+  localStorage.setItem('cps_hist_filter', v);
+  HIST_SIG = '';
+  loadHistory().catch(() => {});
 }
 
 // 请求指标列（上下文 / 缓存命中 / TPS）；旧记录没有 usage 等字段，显示「—」
@@ -1405,6 +1446,7 @@ $('#loginKey').addEventListener('keydown', (e) => { if (e.key === 'Enter') tryLo
 const HIST_AUTO_ON = localStorage.getItem('cps_hist_auto') !== '0';
 $('#histAuto').checked = HIST_AUTO_ON;
 if (HIST_AUTO_ON) startHistAuto();
+$('#histFilter').value = ['all', 'proxy', 'internal'].includes(localStorage.getItem('cps_hist_filter')) ? localStorage.getItem('cps_hist_filter') : 'all';
 // 账号额度：后端每 10 分钟自动刷新，前端同步刷新展示（每 10 分钟），与后端周期错开避免同时请求
 setInterval(() => loadAccounts().catch(() => {}), 10 * 60 * 1000);
 // 仅当服务端开启鉴权且本地没有已保存的密钥时才弹登录框
