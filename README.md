@@ -84,7 +84,7 @@ location / {
 |---|---|
 | `CLINE_PASS_KEY` | 上游 Cline Pass API Key（无 config 时自动创建账号） |
 | `PROXY_KEY` | 下游代理密钥（客户端访问代理的凭据） |
-| `ACCOUNT_ROUTE_REFRESH_MINUTES` | 按 key 路由检测周期（分钟，默认 `15`，`0` = 关闭）；只检测开启了 `officialOnly` 的模型 |
+| `ACCOUNT_ROUTE_REFRESH_MINUTES` | 按 key 路由检测周期（分钟，默认 `15`，`0` = 关闭）；只检测开启了 `officialOnly` 的模型，且跳过该周期内已被真实请求确认过的 key |
 | `ACCOUNT_ROUTE_RECOVERY_SECONDS` | 轮询跳过非官方 key 时的即时复检最小间隔（秒，默认 `300`，`0` = 关闭即时复检；定时检测仍独立生效） |
 | `PUBLIC_BASE_URL` | 门户展示的公网代理地址，如 `https://pass.example.com` |
 | `PORT` / `BIND_HOST` / `DATA_DIR` | 端口 / 绑定地址（容器内为 0.0.0.0）/ 配置目录 |
@@ -171,6 +171,9 @@ Cline 会静默变更规划器行为：某些模型的 `providerOptions.gateway.
 
 1. **检测**：对每个启用的 key 发一条 `max_tokens=32` 的最小流式请求，从响应元数据读取
    `finalProvider` 与规划器返回的 `plannedProviders`（该 key 凭证池里可用的渠道集合）。
+   真实代理请求的响应同样带 `finalProvider`，所以每次实际转发也会顺带更新该 key 的判定：
+   连续 3 次实测落到非官方渠道才降级（单次只告警，避免官方渠道限流被网关挪到后备渠道这类偶发情况误判），
+   任意一次命中官方即清零；探测结果（定时 / 手动 / 首次兜底）始终直接生效。
 2. **判定**：以 key 的**实际命中渠道**（`finalProvider`）为准，命中官方渠道才算「官方 key」；
    只有探测不到实际 provider 时才退回看凭证池（`plannedProviders`）。仅凭「凭证池里有官方渠道」不算数——
    例如 `deepseek-v4.1-flash-1017` 的所有 key 池里都含 `deepseek` 作为后备，但 `账号6` 实际首选 `pareto`，必须判为非官方。官方渠道来自
@@ -178,7 +181,8 @@ Cline 会静默变更规划器行为：某些模型的 `providerOptions.gateway.
 3. **轮询**：仍然只是纯轮询，但该模型只在官方 key 之间轮；非官方 key 直接被跳过。
 4. **恢复检测**：
    - 轮询到被跳过的非官方 key 时，顺带发起一次即时复检（默认每个 key 最多 5 分钟一次，`ACCOUNT_ROUTE_RECOVERY_SECONDS`）；
-   - 后台每 15 分钟对所有官方过滤模型做一次全量检测（`ACCOUNT_ROUTE_REFRESH_MINUTES`，设 `0` 关闭）；
+   - 后台每 15 分钟补测一轮官方过滤模型（`ACCOUNT_ROUTE_REFRESH_MINUTES`，设 `0` 关闭）：默认只测近一个周期内
+     没有真实请求确认过的 key，即主要用于发现非官方 key 是否恢复，也兜住完全没有流量的模型；
    - 一旦某个 key 恢复成官方渠道，下一次轮询就会自动重新使用它，无需手工操作。
 5. **严格拦截**：如果一个官方 key 都没有，代理会直接返回 `503`（`type: key_filter_error`），**不会**回退到非官方 key；
    同时顺手触发一轮复检，key 恢复成官方渠道后下一个请求自动继续。内部诊断（探测/校验）不受此限制。
