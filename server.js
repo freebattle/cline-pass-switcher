@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { Readable, Transform } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -875,6 +876,68 @@ function record(modelId, info) {
   saveMeta();
 }
 
+// ---------- 请求指标（上下文 / 缓存命中 / TTFT / TPS）----------
+// usage 是上游的 OpenAI 兼容结构：非流式在应答顶层，流式在最后一个 chunk（实测不带 stream_options 也会给）。
+// 上下文 = prompt_tokens；缓存命中取 prompt_tokens_details.cached_tokens，Anthropic 风格的 cache_read_input_tokens 兜底。
+function usageMetrics(u) {
+  if (!u || typeof u !== 'object') return null;
+  const num = (v) => (v == null || !Number.isFinite(Number(v)) ? null : Number(v));
+  const prompt = num(u.prompt_tokens);
+  const completion = num(u.completion_tokens);
+  if (prompt == null && completion == null) return null;
+  return {
+    prompt,
+    cached: num(u.prompt_tokens_details?.cached_tokens ?? u.cache_read_input_tokens),
+    completion,
+    reasoning: num(u.completion_tokens_details?.reasoning_tokens),
+  };
+}
+
+// TPS 只算生成阶段：completion_tokens / (结束 - 首 token)。生成段太短（整段几乎一次到达）时算出来的值没有意义，不给。
+const TPS_MIN_GEN_MS = 200;
+function tpsOf(completion, genMs) {
+  if (!completion || !(genMs >= TPS_MIN_GEN_MS)) return null;
+  return Math.round((completion / genMs) * 10000) / 10;
+}
+
+// 非流式拿不到首 token 时间：TTFT 留空，TPS 用成功那次尝试的整段耗时估算（含预填充，偏低），标记 tpsApprox。
+function nonStreamMetrics(out, trace) {
+  const usage = usageMetrics(out?.usage);
+  const ok = [...(trace || [])].reverse().find((t) => t.status === 200);
+  const tps = usage ? tpsOf(usage.completion, ok?.ms) : null;
+  return { usage, ttftMs: null, tps, tpsApprox: tps != null };
+}
+
+// 流式首 token：第一个带非空 content / reasoning / tool_calls 增量的 chunk 到达的时刻（只有 role 或元数据的 chunk 不算）。
+// 按到达顺序喂入原始字节，找到后不再解析。
+function firstTokenProbe() {
+  const decoder = new StringDecoder('utf8');
+  let pending = '';
+  let at = null;
+  return {
+    get at() { return at; },
+    feed(chunk, ts) {
+      if (at != null) return;
+      const lines = (pending + decoder.write(chunk)).split('\n');
+      pending = lines.pop();
+      for (const raw of lines) {
+        const line = raw.trim();
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        let c;
+        try { c = JSON.parse(payload); } catch { continue; }
+        const d = c?.choices?.[0]?.delta;
+        if (d && (d.content || d.reasoning || d.reasoning_content || (Array.isArray(d.tool_calls) && d.tool_calls.length))) {
+          at = ts;
+          pending = '';
+          return;
+        }
+      }
+    },
+  };
+}
+
 // ---------- 聊天代理 ----------
 const CHAT_PATHS = new Set(['/chat/completions', '/v1/chat/completions', '/api/v1/chat/completions']);
 
@@ -1165,6 +1228,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
           // 因此读到出现换行（首个完整 SSE 事件）或达到上限为止。
           const SSE_HEAD_MAX = 64 * 1024;
           let firstChunk = null;
+          let firstChunkAt = null;
           if (isSSE) {
             let reader = null;
             try {
@@ -1185,6 +1249,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
                 netError = 'empty stream';
               } else {
                 firstChunk = Buffer.concat(parts);
+                firstChunkAt = Date.now();
                 const head = firstChunk.toString('utf8').trimStart().slice(0, 200);
                 if (head.startsWith('data:')) {
                   // 错误帧形如 data: {"id":...,"choices":[],"error":{...}}，需解析 error 字段而非只看开头
@@ -1236,7 +1301,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
           // 真 SSE：firstChunk 与剩余 body 串联透传（SSE 开始后无法重试）；close 钩子保留用于客户端断开时中止上游
           keepCloseHook = true;
           trace.push({ upstream: attempt.upstream, status: 200, ms, note: 'stream', try: attempt.try, tries: attempt.tries });
-          return { status: 200, streamUp: up, streamHead: firstChunk, acc, trace, t0 };
+          return { status: 200, streamUp: up, streamHead: firstChunk, streamHeadAt: firstChunkAt, acc, trace, t0 };
         }
         // 非流式
         const r = await attemptOnce(modelId, body, attempt, ctrl.signal, { strictKey });
@@ -1303,10 +1368,13 @@ async function handleChat(req, res) {
       'X-Cline-Key-Route': headerSafe(acc.keyProvider || 'unknown'),
     });
     if (chain.streamHead) res.write(chain.streamHead);
+    const ft = firstTokenProbe();
+    if (chain.streamHead) ft.feed(chain.streamHead, chain.streamHeadAt ?? Date.now());
     const buf = [];
     const tap = new Transform({
-      transform(c, enc, cb) { buf.push(c); cb(null, c); },
+      transform(c, enc, cb) { ft.feed(c, Date.now()); buf.push(c); cb(null, c); },
       flush(cb) {
+        const endAt = Date.now();
         const text = Buffer.concat(buf).toString('utf8');
         let provider = null, canonical = null, streamPipeline = null;
         // direct 管道：最后一个 chunk 顶层带 provider（显示名）与 model
@@ -1333,7 +1401,16 @@ async function handleChat(req, res) {
           const cfgNow = config.perModel[modelId] || {};
           if (okAttempt?.upstream) notePinOutcome(modelId, { upstream: okAttempt.upstream, strict: (cfgNow.pinMode || 'strict') === 'strict' }, { pipeline: 'planner', finalProvider: provider });
         }
-        record(modelId, { provider, canonical, ms: Date.now() - t0, stream: true, error: null, account: acc.name, keyProvider: acc.keyProvider || null, keyFilter: acc.keyFilter || null, attempts: chain.trace.map((t) => t.upstream || 'auto'), trace: chain.trace });
+        // usage 在最后一个带 usage 的 chunk；首块（streamHead）不在 buf 里，但它不会是最后一块
+        let usage = null;
+        for (let i = lines.length - 1; i >= 0 && i >= lines.length - 30 && !usage; i--) {
+          const l = lines[i];
+          if (!l.startsWith('data:') || !l.includes('"usage"')) continue;
+          try { usage = usageMetrics(JSON.parse(l.slice(5)).usage); } catch { /* 跳过不完整行 */ }
+        }
+        const ttftMs = ft.at != null ? ft.at - t0 : null;
+        const tps = usage && ft.at != null ? tpsOf(usage.completion, endAt - ft.at) : null;
+        record(modelId, { provider, canonical, ms: endAt - t0, stream: true, error: null, account: acc.name, keyProvider: acc.keyProvider || null, keyFilter: acc.keyFilter || null, attempts: chain.trace.map((t) => t.upstream || 'auto'), trace: chain.trace, usage, ttftMs, tps, tpsApprox: false });
         cb();
       },
     });
@@ -1359,6 +1436,7 @@ async function handleChat(req, res) {
     account: acc ? acc.name : null,
     keyProvider: acc?.keyProvider || null,
     keyFilter: acc?.keyFilter || null,
+    ...(status === 200 ? nonStreamMetrics(out, chain.trace) : {}),
   });
   res.writeHead(status, {
     'Content-Type': 'application/json',
@@ -1482,7 +1560,7 @@ const server = http.createServer(async (req, res) => {
         });
       }
       const r = parseRouting(chain.out);
-      record(model, { provider: r.finalProvider, canonical: r.canonicalSlug, ms: Date.now() - t0, stream: false, attempts: trace.map((t) => t.upstream || 'auto'), trace, error: null, account: chain.acc?.name || null, keyProvider: chain.acc?.keyProvider || null, keyFilter: chain.acc?.keyFilter || null });
+      record(model, { provider: r.finalProvider, canonical: r.canonicalSlug, ms: Date.now() - t0, stream: false, attempts: trace.map((t) => t.upstream || 'auto'), trace, error: null, account: chain.acc?.name || null, keyProvider: chain.acc?.keyProvider || null, keyFilter: chain.acc?.keyFilter || null, ...nonStreamMetrics(chain.out, trace) });
       return sendJSON(res, 200, {
         ok: true, ms: Date.now() - t0,
         targets: (cfg.upstreams || []).filter(Boolean), exclude: cfg.exclude || [],
