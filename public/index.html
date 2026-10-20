@@ -545,12 +545,32 @@ function policySnippet(s) {
   return `${key} = ${JSON.stringify(o)}`;
 }
 
-// 按模型的 key 路由过滤：只使用命中官方渠道的 key（如 deepseek 官方 vs 第三方渠道）
+// 官方渠道的来源（与后端 officialSourceFor 的分支一一对应）
+const OFFICIAL_SRC = {
+  manual: { label: '手动指定', hint: '官方渠道来自手动填写；清空即回到自动解析' },
+  'pin-list': { label: '钉住列表', hint: '钉住生效：官方渠道 = 当前钉住列表，换钉住渠道后判定自动跟随' },
+  'pin-first': { label: '钉住首要渠道', hint: '钉住失效或未校验：官方渠道 = 路由策略的第一个渠道（建议点右侧「检测钉住」）' },
+  slug: { label: '模型推断', hint: '没有钉住配置：按模型 canonicalSlug 推断官方渠道' },
+};
+
+// 按模型的 key 路由过滤：只使用命中官方渠道的 key（官方渠道默认跟随钉住）
 function keyFilterHtml(id, s) {
   const cfg = s.config || {};
-  const kf = s.keyFilter || { accounts: [], officialProviders: [] };
+  const kf = s.keyFilter || { accounts: [], officialProviders: [], officialSource: 'slug' };
   const official = kf.officialProviders || [];
+  const src = OFFICIAL_SRC[kf.officialSource] || OFFICIAL_SRC.slug;
   const checked = !!cfg.officialOnly;
+  const meta = s.meta || {};
+  const ph = meta.pinHealth;
+  const pin = meta.pipeline === 'direct'
+    ? { txt: '钉住生效（直连）', cls: 'green', title: 'OpenRouter 直连管道：provider.only 直接透传' }
+    : !meta.pipeline
+      ? { txt: '管道未探测', cls: '', title: '先点右侧「探测」确认管道类型' }
+      : !ph
+        ? { txt: '钉住未校验', cls: 'orange', title: '还没检测过钉住参数是否被网关遵守；当前按路由策略第一个渠道判定官方' }
+        : ph.ok
+          ? { txt: '钉住生效', cls: 'green', title: ph.reason || '' }
+          : { txt: '钉住失效', cls: 'red', title: ph.reason || 'providerOptions.gateway.only 被网关忽略，钉住不生效' };
   const chips = (kf.accounts || []).filter((a) => a.enabled).map((a) => {
     const tier = a.tier === 0 ? 'ok' : a.tier === 2 ? 'bad' : 'unknown';
     const prov = a.provider || (a.ok === false ? '探测失败' : '未检测');
@@ -559,13 +579,33 @@ function keyFilterHtml(id, s) {
     return `<span class="keyroute ${tier}" title="${escapeHtml(title)}">${escapeHtml(a.name)}: ${escapeHtml(prov)}${mark}</span>`;
   }).join('');
   return `<div class="keyfilter">
-    <label title="开启后该模型只在「探测到可命中官方渠道」的 key 之间轮询；非官方 key 会被跳过，并在轮询到它时/定时复检是否恢复">
+    <label title="开启后该模型只在「命中官方渠道」的 key 之间轮询；非官方 key 会被跳过，并在轮询到它时/定时复检是否恢复。官方渠道默认跟随钉住配置">
       <input type="checkbox" ${checked ? 'checked' : ''} onchange="setOfficialOnly('${id}', this.checked)"> 仅使用命中官方渠道的 key
     </label>
-    <span>官方渠道：<b>${official.length ? official.map(escapeHtml).join(' / ') : '未探测'}</b></span>
-    <button class="ghost mini" onclick="probeKeys('${id}', this)" title="立即逐 key 检测该模型实际命中的上游">检测 key 路由</button>
+    <span>官方渠道：<b>${official.length ? official.map(escapeHtml).join(' / ') : '未解析'}</b>
+      <span class="badge" title="${escapeHtml(src.hint)}">${src.label}</span>
+      <button class="ghost mini" onclick="editOfficial('${id}')" title="手动指定官方渠道（渠道 slug，逗号分隔，最多 5 个）；输入留空 = 恢复自动解析">✎</button>
+    </span>
+    <span class="badge ${pin.cls}" title="${escapeHtml(pin.title)}">${pin.txt}</span>
+    <button class="ghost mini" onclick="probeKeys('${id}', this)" title="立即逐 key 检测该模型实际命中的上游（按当前路由策略、含钉住参数）">检测 key 路由</button>
     <span class="keyroutes">${chips || '<span class="dim">尚无 key 检测结果</span>'}</span>
   </div>`;
+}
+
+// 手动指定官方渠道：留空 = 回到自动（钉住列表 / 第一个钉住渠道 / 模型推断）
+async function editOfficial(id) {
+  const s = DATA.subscription.find((x) => x.id === id);
+  if (!s) return;
+  const cur = (s.config.officialProviders || []).join(', ');
+  const auto = ((s.keyFilter || {}).officialProviders || []).join(', ') || '（无法解析）';
+  const v = prompt(
+    '官方渠道（渠道 slug，逗号分隔，最多 5 个）。\n留空 = 自动：钉住生效用钉住列表，钉住失效/未校验用第一个钉住渠道，未钉住按模型推断。\n当前解析结果：' + auto,
+    cur,
+  );
+  if (v === null) return;
+  const list = [...new Set(String(v).split(/[,，\s]+/).map((x) => x.trim()).filter(Boolean))].slice(0, 5);
+  await saveModelCfg(id, { officialProviders: list });
+  status(list.length ? `官方渠道已手动指定：${list.join(' / ')}（正在重新检测 key）` : '官方渠道已恢复自动解析（正在重新检测 key）');
 }
 
 async function setOfficialOnly(id, on) {
@@ -1042,6 +1082,8 @@ async function saveModelCfg(id, patch) {
   const s = DATA.subscription.find((x) => x.id === id);
   if (!s) return;
   const cfg = s.config;
+  // 钉住配置变了，官方渠道的解析结果（以及每 key 的判定）都会变，保存后要重测一轮
+  const pinChanged = ['upstreams', 'exclude', 'pinMode', 'officialProviders'].some((k) => patch[k] !== undefined);
   const full = {
     upstreams: patch.upstreams !== undefined ? patch.upstreams : (cfg.upstreams || []),
     exclude: patch.exclude !== undefined ? patch.exclude : (cfg.exclude || []),
@@ -1056,6 +1098,7 @@ async function saveModelCfg(id, patch) {
     if (r.ok) {
       cfg.upstreams = full.upstreams; cfg.exclude = full.exclude; cfg.pinMode = full.pinMode; cfg.sort = full.sort; cfg.retries = full.retries; cfg.officialOnly = full.officialOnly; cfg.officialProviders = full.officialProviders;
       status(`${id} 配置已保存`);
+      if (full.officialOnly && pinChanged) probeKeys(id);
     } else {
       status(`${id} 保存失败：${r.error?.message || '未知错误'}`);
       await loadAll();

@@ -171,13 +171,20 @@ Cline 会静默变更规划器行为：某些模型的 `providerOptions.gateway.
 
 1. **检测**：对每个启用的 key 发一条 `max_tokens=32` 的最小流式请求，从响应元数据读取
    `finalProvider` 与规划器返回的 `plannedProviders`（该 key 凭证池里可用的渠道集合）。
+   探测请求会带上该模型当前的路由策略（`only` / `order` / 排除 / 排序），测的是**真实转发会走的路由**；
+   模型被钉住时，每个 key 都应测出钉住的渠道，而不是它不带钉住时的自然路由。
    真实代理请求的响应同样带 `finalProvider`，所以每次实际转发也会顺带更新该 key 的判定：
    连续 3 次实测落到非官方渠道才降级（单次只告警，避免官方渠道限流被网关挪到后备渠道这类偶发情况误判），
    任意一次命中官方即清零；探测结果（定时 / 手动 / 首次兜底）始终直接生效。
 2. **判定**：以 key 的**实际命中渠道**（`finalProvider`）为准，命中官方渠道才算「官方 key」；
-   只有探测不到实际 provider 时才退回看凭证池（`plannedProviders`）。仅凭「凭证池里有官方渠道」不算数——
-   例如 `deepseek-v4.1-flash-1017` 的所有 key 池里都含 `deepseek` 作为后备，但 `账号6` 实际首选 `pareto`，必须判为非官方。官方渠道来自
-   `perModel[].officialProviders`；留空时按模型 `canonicalSlug` 的第一段推断（如 `deepseek/deepseek-v4.1-flash` → `deepseek`）。
+   只有探测不到实际 provider 时才退回看凭证池（`plannedProviders`）。仅凭「凭证池里有官方渠道」不算数。
+   「官方渠道」的解析优先级：
+   1. `perModel[].officialProviders` 手动指定（控制台点官方渠道旁的 ✎ 填写，留空 = 自动）；
+   2. 配了钉住列表（`upstreams`）时跟随钉住：钉住生效 → 整张钉住列表（`preferred` 的回退项也算）；
+      钉住失效或未校验 → 列表第一个，即上游路由策略的第一个渠道；
+   3. 没有钉住配置 → 按模型 `canonicalSlug` 的第一段推断（如 `deepseek/deepseek-v4.1-flash` → `deepseek`）。
+   控制台会在官方渠道后标出来源（`钉住列表` / `钉住首要渠道` / `手动指定` / `模型推断`）和钉住状态，
+   换钉住渠道后判定自动跟随，并重新跑一轮检测。
 3. **轮询**：仍然只是纯轮询，但该模型只在官方 key 之间轮；非官方 key 直接被跳过。
 4. **恢复检测**：
    - 轮询到被跳过的非官方 key 时，顺带发起一次即时复检（默认每个 key 最多 5 分钟一次，`ACCOUNT_ROUTE_RECOVERY_SECONDS`）；

@@ -46,7 +46,7 @@ const DEFAULT_CONFIG = {
   ],
   // modelId -> { upstreams: string[]（有序优先列表，空=自动）, exclude: string[]（排除列表，优先级高于勾选）,
   //              pinMode: 'strict'|'preferred', sort: 'cost'|'ttft'|'tps'|null, retries: 1..5（每个渠道的尝试次数）,
-  //              officialOnly: boolean（只使用命中官方渠道的 key）, officialProviders: string[]（官方渠道 slug，空=按 canonicalSlug 自动推断） }
+  //              officialOnly: boolean（只使用命中官方渠道的 key）, officialProviders: string[]（官方渠道 slug；空=自动：跟随钉住列表，钉住失效/未校验取第一个钉住渠道，无钉住按 canonicalSlug 推断） }
   // 请求按 upstreams 顺序逐个钉住尝试：同一渠道先重试 retries 次（默认 1 = 不重试），仍失败才顺切下一个，
   // 全部失败才把最后一个错误透传给客户端；exclude 中的上游永不被使用（自动模式下注入排除偏好）。
   // 确定性错误（不可钉 / key 失效）不浪费重试次数，直接跳到下一个渠道。
@@ -139,12 +139,26 @@ function accountRouteRecord(modelId, acc) {
   return (META.models?.[modelId]?.keyRouting || {})[quotaFingerprint(acc.key)] || null;
 }
 
-// 「官方渠道」：优先用 perModel.officialProviders 显式配置；否则取 canonicalSlug 的第一段
-// （如 deepseek/deepseek-v4.1-flash → deepseek）。canonicalSlug 缺失或为私有前缀时，用模型名的第一段猜。
+// 钉住是否真的生效：直连管道（OpenRouter）的 provider.only 本来就透传；
+// 规划器管道看 pinHealth（非法渠道哨兵是否被路由层拒绝）。
+function pinEffective(modelId) {
+  const meta = META.models?.[modelId] || {};
+  if (meta.pipeline === 'direct') return true;
+  return meta.pinHealth?.ok === true;
+}
+
+// 「官方渠道」的解析优先级：
+// 1. perModel.officialProviders 显式配置；
+// 2. 配了钉住列表（upstreams）就跟随钉住：生效时用整张列表（preferred 的回退项也算，
+//    请求本来就可能落到列表内的其它渠道）；失效或未校验时用列表第一个（上游路由策略的第一个）；
+// 3. 没有钉住配置时按 canonicalSlug 的第一段推断（如 deepseek/deepseek-v4.1-flash → deepseek），
+//    canonicalSlug 缺失或为私有前缀时用模型名的第一段猜。
 function officialProvidersFor(modelId) {
   const cfg = config.perModel?.[modelId] || {};
   const explicit = (cfg.officialProviders || []).filter((u) => typeof u === 'string' && u);
   if (explicit.length) return explicit;
+  const pinned = (cfg.upstreams || []).filter((u) => typeof u === 'string' && u);
+  if (pinned.length) return pinEffective(modelId) ? pinned : pinned.slice(0, 1);
   const meta = META.models?.[modelId] || {};
   const slug = String(meta.canonicalSlug || meta.openrouterSlug || '');
   let p = slug.split('/')[0];
@@ -152,6 +166,15 @@ function officialProvidersFor(modelId) {
     p = String(modelId).replace(/^cline-pass\//, '').split('-')[0];
   }
   return p ? [p] : [];
+}
+
+// 官方渠道的来源，供控制台标注（与 officialProvidersFor 的分支一一对应）
+function officialSourceFor(modelId) {
+  const cfg = config.perModel?.[modelId] || {};
+  if ((cfg.officialProviders || []).filter((u) => typeof u === 'string' && u).length) return 'manual';
+  const pinned = (cfg.upstreams || []).filter((u) => typeof u === 'string' && u);
+  if (pinned.length) return pinEffective(modelId) ? 'pin-list' : 'pin-first';
+  return 'slug';
 }
 
 // 0 = 已知命中官方渠道；1 = 尚未检测 / 探测失败（未知）；2 = 已确认非官方渠道。
@@ -163,7 +186,7 @@ function keyRouteTier(modelId, acc) {
   const rec = accountRouteRecord(modelId, acc);
   if (!rec || !rec.ok) return 1;
   // 以「实际命中」为准：探测到了 provider 就直接判定。
-  // 注意不能因为凭证池（plannedProviders）里含官方渠道就放行——例如 deepseek-v4.1-flash-1017
+  // 注意不能因为凭证池（plannedProviders）里含官方渠道就放行——例如未钉住时，deepseek-v4.1-flash-1017
   // 的所有 key 池里都有 deepseek 作为后备，但有的 key（如 账号6）实际首选是 pareto，
   // 放行会导致请求真的落到非官方渠道。
   if (rec.provider) return official.includes(rec.provider) ? 0 : 2;
@@ -188,6 +211,8 @@ function keyRouteView(modelId) {
   return {
     officialOnly: !!cfg.officialOnly,
     officialProviders: official,
+    officialSource: officialSourceFor(modelId),
+    pinEffective: pinEffective(modelId),
     accounts: (config.accounts || []).filter((a) => a && a.key).map((a) => {
       const rec = accountRouteRecord(modelId, a);
       return {
@@ -206,15 +231,19 @@ function keyRouteView(modelId) {
 }
 
 // 用一条最小流式请求探测该 key 在该模型下实际命中的上游（流式可规避推理模型非流式空内容导致的 500）。
+// 请求要带上该模型当前的路由策略（only / order / 排除 / 排序），否则测到的是 key 的自然路由，
+// 和真实转发（可能被钉住）对不上：钉住生效时每个 key 都应测出钉住的渠道。
 async function detectAccountRoute(modelId, acc, { timeoutMs = 45000, trigger = null } = {}) {
   const t0 = Date.now();
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
+    const attempt = buildAttempts(modelId, config.perModel?.[modelId] || {})[0] || {};
+    const body = injectPrefs({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 32, stream: true }, modelId, attempt);
     const res = await fetch(`${config.upstreamBase}/chat/completions`, {
       method: 'POST',
       headers: chatHeaders(acc.key),
-      body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 32, stream: true }),
+      body: JSON.stringify(body),
       signal: ctrl.signal,
     });
     const ctype = res.headers.get('content-type') || '';
