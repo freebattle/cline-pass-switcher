@@ -87,6 +87,8 @@
   .uprow.excluded .upms { opacity: .5; }
   /* 请求历史指标列：TTFT 沿用延迟三档配色，缓存命中 绿≥50% 橙>0 灰=0 */
   td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.src { white-space: nowrap; }
+  .hastip { cursor: help; text-decoration: underline dotted var(--dim); text-underline-offset: 3px; }
   .mt.fast { color: var(--green); } .mt.mid { color: var(--orange); } .mt.slow { color: var(--red); } .mt.none { color: var(--dim); }
   /* 药丸切换按钮：整颗可点（约 60×30px），三态：默认灰 / 优先蓝 / 排除红 */
   .pill { flex: none; border: 1px solid var(--border); background: transparent; color: var(--dim); border-radius: 15px; padding: 5px 14px; font-size: 12px; cursor: pointer; min-width: 56px; text-align: center; line-height: 1; }
@@ -292,8 +294,8 @@
       </div>
     </div>
     <table>
-      <thead><tr><th>时间</th><th>来源</th><th>模型</th><th>账号</th><th>实际上游</th><th>背后模型</th><th>耗时</th><th title="输入 prompt tokens；下方小字为输出 tokens">上下文</th><th title="缓存命中 tokens / 输入 tokens">缓存命中</th><th title="首 token 时间：从代理收到请求到第一个内容 / 推理 / 工具调用增量（含故障转移耗时）；仅流式">TTFT</th><th title="生成速度：输出 tokens / (结束 - 首 token)；≈ 为非流式按整段耗时估算">TPS</th><th>方式</th><th>尝试序列 / 备注</th></tr></thead>
-      <tbody id="histBody"><tr><td colspan="13" class="empty">暂无记录</td></tr></tbody>
+      <thead><tr><th>时间</th><th>来源</th><th title="鼠标悬停在模型名上可查看背后模型">模型</th><th>账号</th><th>实际上游</th><th>耗时</th><th title="输入 prompt tokens；下方小字为输出 tokens">上下文</th><th title="缓存命中 tokens / 输入 tokens">缓存命中</th><th title="首 token 时间：从代理收到请求到第一个内容 / 推理 / 工具调用增量（含故障转移耗时）；仅流式">TTFT</th><th title="生成速度：输出 tokens / (结束 - 首 token)；≈ 为非流式按整段耗时估算">TPS</th><th>方式</th><th>尝试序列 / 备注</th></tr></thead>
+      <tbody id="histBody"><tr><td colspan="12" class="empty">暂无记录</td></tr></tbody>
     </table>
   </div>
 
@@ -1179,18 +1181,17 @@ async function loadHistory() {
   const filter = $('#histFilter').value;
   const rows = filter === 'all' ? history : history.filter((h) => (isProxyEntry(h) ? 'proxy' : 'internal') === filter);
   $('#histBody').innerHTML = rows.length ? rows.map((h) => `<tr>
-      <td>${fmt(h.ts)}</td><td>${sourceCell(h)}</td><td class="mono">${shortId(h.model)}</td>
+      <td>${fmt(h.ts)}</td><td class="src">${sourceCell(h)}</td><td class="mono">${modelCell(h)}</td>
       <td>${h.account ? '<span class="badge">' + escapeHtml(h.account) + '</span>' + (h.keyProvider ? '<div class="dim" style="font-size:11px; margin-top:2px">' + escapeHtml(h.keyProvider) + '</div>' : '') : '<span class="dim">—</span>'}</td>
       <td>${h.provider ? '<span class="badge">' + h.provider + '</span>' : '<span class="dim">—</span>'}</td>
-      <td class="mono dim">${h.canonical || '—'}</td>
-      <td>${h.ms ?? '—'} ms</td>
+      <td class="num">${h.ms ?? '—'} ms</td>
       <td class="num">${ctxCell(h.usage)}</td>
       <td class="num">${cacheCell(h.usage)}</td>
       <td class="num">${h.ttftMs == null ? DASH : `<span class="mt ${msCls(h.ttftMs)}">${msLabel(h.ttftMs)}</span>`}</td>
       <td class="num">${tpsCell(h)}</td>
       <td>${h.stream ? '流式' : '非流式'}</td>
       <td class="dim">${historyTrace(h) || internalNote(h) || '—'}</td>
-    </tr>`).join('') : `<tr><td colspan="13" class="empty">${history.length ? '当前筛选下没有记录' : '暂无记录 —— 把客户端 Base URL 指向代理地址即可自动记录'}</td></tr>`;
+    </tr>`).join('') : `<tr><td colspan="12" class="empty">${history.length ? '当前筛选下没有记录' : '暂无记录 —— 把客户端 Base URL 指向代理地址即可自动记录'}</td></tr>`;
 }
 
 // 请求来源：代理请求（客户端经代理发起）之外，测试 / 探测 / 校验 / key 路由检测也消耗额度，一并记录。
@@ -1205,6 +1206,11 @@ const TRIGGER_LABEL = {
   config: '改配置', auto: '自动',
 };
 const isProxyEntry = (h) => !h.source || h.source === 'proxy';
+// 背后模型不单独占列：悬停在模型名上显示（虚下划线提示可悬停）
+function modelCell(h) {
+  const name = escapeHtml(shortId(h.model));
+  return h.canonical ? `<span class="hastip" title="背后模型：${escapeHtml(h.canonical)}">${name}</span>` : name;
+}
 function sourceCell(h) {
   const src = h.source || 'proxy';
   const label = SOURCE_LABEL[src] || src;
