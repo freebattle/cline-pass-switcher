@@ -87,8 +87,17 @@
   .uprow.excluded .upms { opacity: .5; }
   /* 请求历史指标列：TTFT 沿用延迟三档配色，缓存命中 绿≥50% 橙>0 灰=0 */
   td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
-  td.src { white-space: nowrap; }
-  .hastip { cursor: help; text-decoration: underline dotted var(--dim); text-underline-offset: 3px; }
+  td.src, td.model { white-space: nowrap; }
+  /* 悬停提示：用 CSS 而不是 title。请求历史每 5 秒可能整表重绘，原生 title 要停留约 1 秒才弹出，重绘会打断它 */
+  .hastip { position: relative; cursor: help; text-decoration: underline dotted var(--dim); text-underline-offset: 3px; }
+  .hastip:hover::after {
+    content: attr(data-tip); position: absolute; left: 0; top: calc(100% + 6px); z-index: 30;
+    background: #0f1218; color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+    padding: 5px 8px; font-size: 12px; white-space: nowrap; box-shadow: 0 4px 14px rgba(0,0,0,.45); pointer-events: none;
+  }
+  /* 全局操作反馈：固定在右下角，空时隐藏 */
+  #status { position: fixed; right: 18px; bottom: 18px; z-index: 40; max-width: 480px; background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; font-size: 12.5px; color: var(--text); box-shadow: 0 4px 14px rgba(0,0,0,.45); }
+  #status:empty { display: none; }
   .mt.fast { color: var(--green); } .mt.mid { color: var(--orange); } .mt.slow { color: var(--red); } .mt.none { color: var(--dim); }
   /* 药丸切换按钮：整颗可点（约 60×30px），三态：默认灰 / 优先蓝 / 排除红 */
   .pill { flex: none; border: 1px solid var(--border); background: transparent; color: var(--dim); border-radius: 15px; padding: 5px 14px; font-size: 12px; cursor: pointer; min-width: 56px; text-align: center; line-height: 1; }
@@ -159,32 +168,8 @@
     <b>尚未配置上游 API Key：</b>在下方「账号管理」添加你的 Cline Pass 账号（sk_ 开头的 key）并保存即可开始使用；也可通过 config.json 的 accounts 或环境变量 CLINE_PASS_KEY 提供。
   </div>
 
-  <div id="pinAlert" class="banner" style="display:none; border-left-color: var(--red);"></div>
-
-  <details class="banner">
-    <summary style="color:var(--text)"><b>实测原理：为什么能钉住上游（点开看细节）</b></summary>
-    <div style="margin-top:10px">
-    ① <b>上游可枚举、可观测</b>：订阅模型响应元数据里带背后真正的模型 ID、可用上游列表与本次实际命中的上游；
-    「探测」按钮还会用一次零 token 消耗的假上游请求让网关报出精确的可用上游清单（直连→OpenRouter，规划器→Vercel AI Gateway）。<br>
-    ② <b>两类管道都能精确钉住上游</b>（已实测 <code class="mono">finalProvider</code> 随之改变）：
-    直连管道（OpenRouter）用顶层 <code class="mono">provider.only / order</code>；
-    规划器管道（Vercel AI Gateway）必须用 <code class="mono">providerOptions.gateway.only / order</code>——
-    Cline 会丢弃顶层 <code class="mono">provider</code> 简写里的 <code class="mono">only/order</code>，但会透传 <code class="mono">providerOptions.gateway</code>。
-    两类管道还都支持 <code class="mono">sort</code>（最低成本 / 最快首字 / 最高吞吐）。<br>
-    <b class="policy-warn">⚠ 2026-09 起规划器可能静默失效</b>：Cline 已多次变更规划器，部分模型的
-    <code class="mono">providerOptions.gateway.only</code> 会被整个忽略（连非法渠道 <code class="mono">__probe__</code> 都不再被路由层拒绝）。
-    控制台会自动检测并在顶部弹出<b>钉住失效告警</b>，失效时「校验」不再给假绿，而是标为未判定。直连管道（顶层 <code class="mono">provider.only</code>）目前不受影响。<br>
-    ③ <b>目录模型 :free 变体</b>：属于直连管道，可精确钉住。<br>
-    ④ <b>多上游优先级 + 故障转移</b>：勾选多个上游即按勾选顺序逐个尝试——第一个异常（报错/网络失败/超时）自动顺切下一个，全部失败才把错误透传给客户端；「排除」的上游永不被使用（自动模式下会向网关注入排除偏好）。流式请求在首包（SSE 开始）前同样可切换，SSE 开始后透传不可重试。
-    </div>
-  </details>
-
-  <div class="toolbar">
-    <span class="chip" id="proxyBase" title="点击复制：把任意 OpenAI 兼容客户端的 Base URL 指向这里"></span>
-    <button class="ghost" onclick="loadAll()">↻ 刷新</button>
-    <button class="ghost" onclick="probeAll()" id="probeAllBtn" title="只探测主列表中可见的模型，已隐藏的模型会跳过">批量探测可见模型</button>
-    <span class="dim" style="font-size:12px" id="status"></span>
-  </div>
+  <!-- 全局操作反馈：固定在右下角，页面滚到哪都能看到 -->
+  <div id="status"></div>
 
   <div class="card">
     <h2>账号管理（Cline Pass 账号池）</h2>
@@ -200,25 +185,6 @@
       <thead><tr><th>名称</th><th>API Key</th><th>启用</th><th>额度（5h / 周 / 月）</th><th>请求数</th><th>最近使用</th><th>操作</th></tr></thead>
       <tbody id="accBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
     </table>
-  </div>
-
-  <div class="card">
-    <h2>访问与安全（下游密钥）</h2>
-    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-      <label class="dim" style="font-size:13px">代理密钥：</label>
-      <input id="secProxyKey" type="password" placeholder="空 = 关闭鉴权" style="width:340px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:7px 10px; font-family:Consolas, monospace; font-size:13px">
-      <label class="dim" style="font-size:12px"><input type="checkbox" id="secShow" onchange="$('#secProxyKey').type=this.checked?'text':'password'"> 显示</label>
-      <span id="secBadge" class="badge"></span>
-    </div>
-    <div style="display:flex; gap:10px; align-items:center; margin-top:8px; flex-wrap:wrap;">
-      <label class="dim" style="font-size:13px">公网代理地址：</label>
-      <input id="secPublicBase" placeholder="如 https://cline.xxx.sslip.io（本地留空）" style="width:340px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:7px 10px; font-family:Consolas, monospace; font-size:13px">
-    </div>
-    <div style="display:flex; gap:10px; align-items:center; margin-top:12px; flex-wrap:wrap;">
-      <button onclick="saveSecurity()">保存访问设置</button>
-      <span class="dim" style="font-size:12px">修改密钥后，客户端需改用新密钥；控制台会自动更新本机保存的密钥，不会被锁在外面。</span>
-      <span class="dim" style="font-size:12px" id="secMsg"></span>
-    </div>
   </div>
 
   <div class="card">
@@ -266,22 +232,6 @@
   </div>
 
   <div class="card">
-    <h2>按账号探测上游（同一模型在各账号下实际命中的供应商）</h2>
-    <div class="dim" style="font-size:12.5px; margin:6px 0 10px">
-      不同账号的可用凭证池可能不同，导致同一模型被路由到不同上游供应商（例如官方 deepseek vs 第三方/私有渠道）。
-      这里逐一探测每个账号实际命中的上游；在模型行勾选「仅使用命中官方渠道的 key」后，非官方 key 会自动从该模型的轮询里跳过，
-      并在轮询到它时/定时复检它是否已恢复为官方渠道。
-    </div>
-    <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
-      <select id="accProbeModel" style="min-width:240px"></select>
-      <label class="dim" style="font-size:12px"><input type="checkbox" id="accProbeDisabled"> 包含未启用账号</label>
-      <button onclick="probeAccountsRun(this)" id="accProbeBtn">按账号探测</button>
-      <span class="dim" style="font-size:12px" id="accProbeMsg"></span>
-    </div>
-    <div id="accProbeResult"></div>
-  </div>
-
-  <div class="card">
     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
       <h2 style="margin:0">请求历史（所有消耗 token 的请求：代理请求保留最近 100 条，测试 / 探测 / 校验等内部请求另保留 200 条）</h2>
       <div style="display:flex; align-items:center; gap:12px;">
@@ -309,6 +259,67 @@
       <input id="catFilter" placeholder="输入过滤… 如 free / glm / anthropic" style="margin:10px 0; width:300px; display:block">
       <table><tbody id="catBody"></tbody></table>
     </details>
+  </div>
+
+  <!-- 以下为低频诊断与设置，放在页面最下方 -->
+  <div class="card">
+    <h2>按账号探测上游（同一模型在各账号下实际命中的供应商）</h2>
+    <div class="dim" style="font-size:12.5px; margin:6px 0 10px">
+      和模型行的「检测 key 路由」是同一种探测（结果也会同步到模型行）；这里额外列出背后模型、凭证池、回退数、耗时并按供应商分组，可包含未启用账号，适合排查。
+      不同账号的可用凭证池可能不同，导致同一模型被路由到不同上游供应商（例如官方 deepseek vs 第三方/私有渠道）。
+    </div>
+    <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+      <select id="accProbeModel" style="min-width:240px"></select>
+      <label class="dim" style="font-size:12px"><input type="checkbox" id="accProbeDisabled"> 包含未启用账号</label>
+      <button onclick="probeAccountsRun(this)" id="accProbeBtn">按账号探测</button>
+      <span class="dim" style="font-size:12px" id="accProbeMsg"></span>
+    </div>
+    <div id="accProbeResult"></div>
+  </div>
+
+  <div id="pinAlert" class="banner" style="display:none; border-left-color: var(--red);"></div>
+
+  <details class="banner">
+    <summary style="color:var(--text)"><b>实测原理：为什么能钉住上游（点开看细节）</b></summary>
+    <div style="margin-top:10px">
+    ① <b>上游可枚举、可观测</b>：订阅模型响应元数据里带背后真正的模型 ID、可用上游列表与本次实际命中的上游；
+    「探测」按钮还会用一次零 token 消耗的假上游请求让网关报出精确的可用上游清单（直连→OpenRouter，规划器→Vercel AI Gateway）。<br>
+    ② <b>两类管道都能精确钉住上游</b>（已实测 <code class="mono">finalProvider</code> 随之改变）：
+    直连管道（OpenRouter）用顶层 <code class="mono">provider.only / order</code>；
+    规划器管道（Vercel AI Gateway）必须用 <code class="mono">providerOptions.gateway.only / order</code>——
+    Cline 会丢弃顶层 <code class="mono">provider</code> 简写里的 <code class="mono">only/order</code>，但会透传 <code class="mono">providerOptions.gateway</code>。
+    两类管道还都支持 <code class="mono">sort</code>（最低成本 / 最快首字 / 最高吞吐）。<br>
+    <b class="policy-warn">⚠ 2026-09 起规划器可能静默失效</b>：Cline 已多次变更规划器，部分模型的
+    <code class="mono">providerOptions.gateway.only</code> 会被整个忽略（连非法渠道 <code class="mono">__probe__</code> 都不再被路由层拒绝）。
+    控制台会自动检测并在本区上方弹出<b>钉住失效告警</b>，失效时「校验」不再给假绿，而是标为未判定。直连管道（顶层 <code class="mono">provider.only</code>）目前不受影响。<br>
+    ③ <b>目录模型 :free 变体</b>：属于直连管道，可精确钉住。<br>
+    ④ <b>多上游优先级 + 故障转移</b>：勾选多个上游即按勾选顺序逐个尝试——第一个异常（报错/网络失败/超时）自动顺切下一个，全部失败才把错误透传给客户端；「排除」的上游永不被使用（自动模式下会向网关注入排除偏好）。流式请求在首包（SSE 开始）前同样可切换，SSE 开始后透传不可重试。
+    </div>
+  </details>
+
+  <div class="toolbar">
+    <span class="chip" id="proxyBase" title="点击复制：把任意 OpenAI 兼容客户端的 Base URL 指向这里"></span>
+    <button class="ghost" onclick="loadAll()">↻ 刷新</button>
+    <button class="ghost" onclick="probeAll()" id="probeAllBtn" title="只探测主列表中可见的模型，已隐藏的模型会跳过">批量探测可见模型</button>
+  </div>
+
+  <div class="card">
+    <h2>访问与安全（下游密钥）</h2>
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <label class="dim" style="font-size:13px">代理密钥：</label>
+      <input id="secProxyKey" type="password" placeholder="空 = 关闭鉴权" style="width:340px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:7px 10px; font-family:Consolas, monospace; font-size:13px">
+      <label class="dim" style="font-size:12px"><input type="checkbox" id="secShow" onchange="$('#secProxyKey').type=this.checked?'text':'password'"> 显示</label>
+      <span id="secBadge" class="badge"></span>
+    </div>
+    <div style="display:flex; gap:10px; align-items:center; margin-top:8px; flex-wrap:wrap;">
+      <label class="dim" style="font-size:13px">公网代理地址：</label>
+      <input id="secPublicBase" placeholder="如 https://cline.xxx.sslip.io（本地留空）" style="width:340px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:7px 10px; font-family:Consolas, monospace; font-size:13px">
+    </div>
+    <div style="display:flex; gap:10px; align-items:center; margin-top:12px; flex-wrap:wrap;">
+      <button onclick="saveSecurity()">保存访问设置</button>
+      <span class="dim" style="font-size:12px">修改密钥后，客户端需改用新密钥；控制台会自动更新本机保存的密钥，不会被锁在外面。</span>
+      <span class="dim" style="font-size:12px" id="secMsg"></span>
+    </div>
   </div>
 
 <script>
@@ -1177,11 +1188,14 @@ async function loadHistory() {
   // 内容未变化时跳过重绘，避免每 5 秒自动刷新时表格闪烁 / 丢失滚动位置
   const sig = $('#histFilter').value + JSON.stringify(history);
   if (sig === HIST_SIG) return;
+  // 鼠标停在表格上时先不重绘（不更新 HIST_SIG，移开后下一次刷新补上），避免正在看的行和悬停提示被冲掉
+  const body = $('#histBody');
+  if (HIST_SIG && typeof body.matches === 'function' && body.matches(':hover')) return;
   HIST_SIG = sig;
   const filter = $('#histFilter').value;
   const rows = filter === 'all' ? history : history.filter((h) => (isProxyEntry(h) ? 'proxy' : 'internal') === filter);
   $('#histBody').innerHTML = rows.length ? rows.map((h) => `<tr>
-      <td>${fmt(h.ts)}</td><td class="src">${sourceCell(h)}</td><td class="mono">${modelCell(h)}</td>
+      <td>${fmt(h.ts)}</td><td class="src">${sourceCell(h)}</td><td class="mono model">${modelCell(h)}</td>
       <td>${h.account ? '<span class="badge">' + escapeHtml(h.account) + '</span>' + (h.keyProvider ? '<div class="dim" style="font-size:11px; margin-top:2px">' + escapeHtml(h.keyProvider) + '</div>' : '') : '<span class="dim">—</span>'}</td>
       <td>${h.provider ? '<span class="badge">' + h.provider + '</span>' : '<span class="dim">—</span>'}</td>
       <td class="num">${h.ms ?? '—'} ms</td>
@@ -1209,7 +1223,7 @@ const isProxyEntry = (h) => !h.source || h.source === 'proxy';
 // 背后模型不单独占列：悬停在模型名上显示（虚下划线提示可悬停）
 function modelCell(h) {
   const name = escapeHtml(shortId(h.model));
-  return h.canonical ? `<span class="hastip" title="背后模型：${escapeHtml(h.canonical)}">${name}</span>` : name;
+  return h.canonical ? `<span class="hastip" data-tip="背后模型：${escapeHtml(h.canonical)}">${name}</span>` : name;
 }
 function sourceCell(h) {
   const src = h.source || 'proxy';
