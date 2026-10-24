@@ -56,6 +56,8 @@ const DEFAULT_CONFIG = {
   // 真实代理请求实测到非官方渠道会立即改判该 key；定时全量检测只做恢复探测与无流量兜底。
   perModel: {},
   hiddenModels: [],       // 控制台仅隐藏的前端模型 ID（纯展示偏好：不影响代理路由，/v1/models 仍照常返回）
+  // planner 管道注入 only/order 时一并带上的 providerOptions.gateway.has（能力过滤），空数组 = 不带。见 gatewayPrefs。
+  gatewayHas: ['tool-use'],
 };
 
 function loadJson(file, fallback) {
@@ -604,6 +606,18 @@ async function orEndpoints(slug) {
 //   OpenRouter，可精确钉住。
 function slugify(s) { return String(s).toLowerCase().replace(/\s+/g, '-'); }
 
+// planner 管道的 only/order 要配合能力过滤 has 才会被遵守（实测 2026-10-24）：
+// deepseek-v4.1-flash-1017、kimi-k3、qwen3.8-max 只带 only 时被忽略、一律落到 openai-compatible-private，
+// 带上 has（reasoning / tool-use / vision / implicit-caching / structured-output 任一）后 only/order 恢复生效，
+// 非法渠道哨兵也会重新被路由层拒绝；has: [] 无效。glm-5.3、deepseek-v4.1-flash 加了 has 仍被忽略。
+// 默认用 tool-use：对 Cline 的 agent 流量没有额外限制，也不会像 reasoning 那样把非推理模型的渠道筛掉。
+function gatewayPrefs(gw, existing = {}) {
+  const has = Array.isArray(config.gatewayHas) ? config.gatewayHas.filter((h) => typeof h === 'string' && h) : [];
+  const out = { ...existing, ...gw };
+  if ((out.only || out.order) && !existing.has && has.length) out.has = [...has];
+  return out;
+}
+
 function parseRouting(json) {
   const d = json?.data && json.data.choices ? json.data : json;
   const msg = d?.choices?.[0]?.message;
@@ -628,7 +642,7 @@ async function harvestAvailableProviders(modelId, pipeline) {
   const acc = pickAccount(modelId);
   const base = { model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 16 };
   const body = pipeline === 'planner'
-    ? { ...base, providerOptions: { gateway: { only: ['__probe__'] } } }
+    ? { ...base, providerOptions: { gateway: gatewayPrefs({ only: ['__probe__'] }) } }
     : { ...base, provider: { only: ['__probe__'] } };
   const t0 = Date.now();
   const { json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, { method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(body) }, 60000);
@@ -696,7 +710,7 @@ async function verifyPin(modelId) {
   const base = { model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 16 };
   const body = isDirect
     ? { ...base, provider: { only: ['__probe__'] } }
-    : { ...base, providerOptions: { gateway: { only: ['__probe__'] } } };
+    : { ...base, providerOptions: { gateway: gatewayPrefs({ only: ['__probe__'] }) } };
   const t0 = Date.now();
   const { status, json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, {
     method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(body),
@@ -879,7 +893,7 @@ async function validateUpstreams(modelId) {
       const t0 = Date.now();
       const base = { model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 16 };
       const body = pipeline === 'planner'
-        ? { ...base, providerOptions: { gateway: { only: [slug] } } }
+        ? { ...base, providerOptions: { gateway: gatewayPrefs({ only: [slug] }) } }
         : { ...base, provider: { only: [slug] } };
       const { json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, {
         method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(body),
@@ -1126,7 +1140,7 @@ function injectPrefs(body, modelId, { upstream, orderRest = [], excludeList = []
       gw.only = allowList;
     }
     if (sort) gw.sort = sort;
-    b.providerOptions = { ...(b.providerOptions || {}), gateway: { ...(b.providerOptions?.gateway || {}), ...gw } };
+    b.providerOptions = { ...(b.providerOptions || {}), gateway: gatewayPrefs(gw, b.providerOptions?.gateway || {}) };
   }
   if (useOpenRouter) {
     const p = { ...(b.provider || {}) };

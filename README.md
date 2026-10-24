@@ -161,6 +161,18 @@ Cline 会静默变更规划器行为：某些模型的 `providerOptions.gateway.
 - **运行时兜底**：严格钉住的目标与实际 `finalProvider` 不一致时自动记录告警（匹配不清除告警，因为网关默认就可能选中该渠道）。
 - **展示**：控制台顶部红色横幅汇总所有失效模型，模型行显示 `⚠ 钉住失效`；`GET /api/models` 返回 `alerts` 数组，`META.models[id].pinHealth` 持久化检测结果。
 
+### 能力过滤 `has` 让钉住恢复生效（2026-10-24 实测）
+
+部分模型只带 `only` 时会被忽略、一律落到 `openai-compatible-private`；同时带上 `providerOptions.gateway.has`（`reasoning` / `tool-use` / `vision` / `implicit-caching` / `structured-output` 任一）后 `only` / `order` 恢复生效，哨兵 `__probe__` 也重新被路由层拒绝。
+
+| 模型 | 只带 `only` | `only` + `has` |
+|---|---|---|
+| deepseek-v4.1-flash-1017、kimi-k3、qwen3.8-max | 被忽略 | ✔ 生效（1017 钉 deepseek / pareto / baseten / runware 均命中） |
+| minimax-m3、deepseek-v4-pro、qwen3.7-plus、qwen3.7-max | ✔ 生效 | ✔ 生效 |
+| glm-5.3、deepseek-v4.1-flash | 被忽略 | 仍被忽略 |
+
+`has: []` 无效；只带 `has` 不带 `only` 只是过滤，会避开私有渠道但不保证命中官方。代理在 planner 管道注入 `only`/`order` 时（包括哨兵和校验请求）会自动附带 `config.gatewayHas`（默认 `["tool-use"]`，置为 `[]` 关闭）；客户端自己传了 `has` 时以客户端为准。
+
 ---
 
 ## 按模型的 key 路由过滤（官方渠道 key）
